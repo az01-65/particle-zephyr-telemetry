@@ -1,0 +1,29 @@
+/*
+ * argon_gateway board overlay - particle_argon
+ *
+ * particle_argon's upstream board devicetree defaults zephyr,console to
+ * &uart0 (a header-pin UART with nothing physically wired to it on this
+ * bench setup, confirmed by a real hardware test that captured zero serial
+ * bytes). This app's whole job is relaying JSON telemetry over USB serial
+ * to tools/telemetry_monitor.py, so the console needs to ride the board's
+ * native USB port instead - the same cable already used for flashing and
+ * power, no separate UART adapter required.
+ *
+ * The nRF52840's USB device controller is already declared and enabled
+ * upstream as `zephyr_udc0` (in the shared mesh_feather.dtsi included by
+ * both the Argon and Xenon board files), so this overlay only needs to add
+ * a CDC-ACM UART child node under it and repoint the console chosen node -
+ * it does not need to redeclare the controller itself.
+ */
+
+/ {
+	chosen {
+		zephyr,console = &cdc_acm_uart0;
+	};
+};
+
+&zephyr_udc0 {
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};

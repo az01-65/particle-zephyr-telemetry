@@ -51,6 +51,9 @@
 #include <string.h>
 
 #include <zephyr/kernel.h>
+#include <zephyr/device.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/drivers/uart.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/util.h>
@@ -456,8 +459,36 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
  * ===========================================================================
  */
 
+/* With a native USB-CDC console (see boards/particle_argon.overlay), early
+ * printk()/LOG_INF output before a host has actually opened the serial port
+ * can be silently dropped -- there's no DTR asserted yet. Wait for DTR with
+ * a bounded timeout so the app still proceeds (BLE scanning is useful even
+ * with nobody watching the console) if nothing ever opens the port.
+ */
+#define CONSOLE_DTR_WAIT_TIMEOUT_MS 3000
+#define CONSOLE_DTR_POLL_INTERVAL_MS 100
+
+static void wait_for_console_dtr(void)
+{
+	const struct device *const console_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+	uint32_t dtr = 0;
+	int waited_ms = 0;
+
+	if (!device_is_ready(console_dev)) {
+		return;
+	}
+
+	while (!dtr && waited_ms < CONSOLE_DTR_WAIT_TIMEOUT_MS) {
+		uart_line_ctrl_get(console_dev, UART_LINE_CTRL_DTR, &dtr);
+		k_sleep(K_MSEC(CONSOLE_DTR_POLL_INTERVAL_MS));
+		waited_ms += CONSOLE_DTR_POLL_INTERVAL_MS;
+	}
+}
+
 int main(void)
 {
+	wait_for_console_dtr();
+
 	int err = bt_enable(NULL);
 
 	if (err) {
