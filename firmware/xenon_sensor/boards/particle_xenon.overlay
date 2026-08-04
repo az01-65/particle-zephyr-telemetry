@@ -1,0 +1,30 @@
+/*
+ * xenon_sensor board overlay - particle_xenon
+ *
+ * particle_xenon shares mesh_feather.dtsi with particle_argon, which
+ * defaults zephyr,console to &uart0 - a header-pin UART with nothing
+ * physically wired to it on this project's bench setup. This is the exact
+ * same issue already root-caused and fixed for argon_gateway (see
+ * firmware/argon_gateway/boards/particle_argon.overlay for the full
+ * writeup): repoint the console at a native USB-CDC-ACM node instead, so
+ * LOG_INF/printk output actually reaches a connected host over the same USB
+ * cable used for flashing/power, in both Mode 1 (BLE) and Mode 2 (Thread).
+ *
+ * The nRF52840's USB device controller is already declared and enabled
+ * upstream as `zephyr_udc0` (in the shared mesh_feather.dtsi), so this
+ * overlay only needs to add a CDC-ACM UART child node under it and repoint
+ * the console chosen node - it does not need to redeclare the controller
+ * itself.
+ */
+
+/ {
+	chosen {
+		zephyr,console = &cdc_acm_uart0;
+	};
+};
+
+&zephyr_udc0 {
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};
