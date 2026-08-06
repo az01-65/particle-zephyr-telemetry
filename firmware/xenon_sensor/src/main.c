@@ -624,6 +624,15 @@ static struct net_sockaddr_in6 thread_telemetry_dst;
 /* Read by the status LED thread (section 6). */
 static bool thread_attached;
 
+/* Diagnostic only, not used by application logic: the Thread Partition ID
+ * this node has actually joined/formed, readable directly over SWD
+ * (independent of the console's known visibility quirks) to directly
+ * compare against other nodes and confirm they're genuinely on the same
+ * mesh, not just each independently attached to their own separate
+ * partition despite sharing network credentials.
+ */
+volatile uint32_t g_thread_partition_id;
+
 static void thread_state_changed(otChangedFlags flags, void *context)
 {
 	ARG_UNUSED(context);
@@ -641,8 +650,9 @@ static void thread_state_changed(otChangedFlags flags, void *context)
 	case OT_DEVICE_ROLE_CHILD:
 	case OT_DEVICE_ROLE_ROUTER:
 	case OT_DEVICE_ROLE_LEADER:
-		LOG_INF("Thread network join/attach succeeded (role=%s)",
-			otThreadDeviceRoleToString(role));
+		g_thread_partition_id = otThreadGetPartitionId(ot);
+		LOG_INF("Thread network join/attach succeeded (role=%s, partition=0x%08x)",
+			otThreadDeviceRoleToString(role), g_thread_partition_id);
 		thread_attached = true;
 		break;
 	case OT_DEVICE_ROLE_DETACHED:
