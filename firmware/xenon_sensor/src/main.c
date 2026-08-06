@@ -206,28 +206,42 @@ static const char *mode_name(enum device_mode mode)
 #endif
 static const struct gpio_dt_spec mode_button = GPIO_DT_SPEC_GET(MODE_BUTTON_NODE, gpios);
 
-/**
- * Fast, one-shot poll of the MODE button at boot. Deliberately not
- * interrupt-driven or debounced with a delay loop - by the time main() runs
- * this early, a physically held button reads as a stable level, and this
- * needs to stay quick since it sits ahead of everything else in main().
- *
- * gpio_pin_get_dt() already accounts for GPIO_ACTIVE_LOW from the
- * devicetree, so a return value of 1 means "pressed" regardless of the
- * button's electrical polarity.
+/* Set true once mode_button_init() has successfully configured the pin, so
+ * mode_button_read() (called repeatedly during the confirmation gesture in
+ * section 6) doesn't need to reconfigure it on every poll.
  */
-static bool mode_button_is_held(void)
-{
-	int err;
+static bool mode_button_ready;
 
+/**
+ * One-time configuration of the MODE button pin. Deliberately not
+ * interrupt-driven - by the time main() runs this early, a physically held
+ * button reads as a stable level, and plain polling is simplest for a
+ * boot-time gesture.
+ */
+static void mode_button_init(void)
+{
 	if (!gpio_is_ready_dt(&mode_button)) {
-		LOG_ERR("MODE button GPIO not ready; assuming not held");
-		return false;
+		LOG_ERR("MODE button GPIO not ready; will assume never held");
+		return;
 	}
 
-	err = gpio_pin_configure_dt(&mode_button, GPIO_INPUT);
-	if (err) {
-		LOG_ERR("Failed to configure MODE button pin (err %d); assuming not held", err);
+	if (gpio_pin_configure_dt(&mode_button, GPIO_INPUT)) {
+		LOG_ERR("Failed to configure MODE button pin; will assume never held");
+		return;
+	}
+
+	mode_button_ready = true;
+}
+
+/**
+ * Poll the MODE button's current level. gpio_pin_get_dt() already accounts
+ * for GPIO_ACTIVE_LOW from the devicetree, so a return value of 1 means
+ * "pressed" regardless of the button's electrical polarity. Cheap enough to
+ * call repeatedly in the confirmation gesture's polling loop.
+ */
+static bool mode_button_read(void)
+{
+	if (!mode_button_ready) {
 		return false;
 	}
 
@@ -770,19 +784,71 @@ static int status_led_init(void)
 }
 
 /**
- * Blocking rapid red flash confirming a MODE button press was actually
- * registered, called directly from main() right before mode_store()+reboot.
+ * Interactive MODE-button hold-to-confirm gesture, called directly from
+ * main() once a button press is first detected - mirrors argon_gateway's
+ * identical function, see that file for the fuller rationale.
+ *
+ *   Phase A: blinks the CURRENT mode's color MODE_SWITCH_PREVIEW_FLASHES
+ *            times. Releasing here cancels - stays on the current mode.
+ *   Phase B: blinks the TARGET mode's color, indefinitely, until released.
+ *            Releasing here commits the switch.
+ *
+ * Runs with the background status LED thread suspended for its duration -
+ * confirmed on real hardware that without this, the two race over the same
+ * three GPIO pins and the "confirmation" flash shows a garbled mix of
+ * colors rather than a clean sequence.
  */
-static void status_led_flash_mode_switch(void)
-{
-	gpio_pin_set_dt(&led_blue, 0);
-	gpio_pin_set_dt(&led_green, 0);
+#define MODE_SWITCH_PREVIEW_FLASHES 4
+#define MODE_SWITCH_FLASH_HALF_PERIOD_MS 200
 
-	for (int i = 0; i < 6; i++) {
-		gpio_pin_set_dt(&led_red, i % 2);
-		k_sleep(K_MSEC(120));
-	}
+/* Forward reference to the thread ID K_THREAD_DEFINE() creates further down
+ * in this section - needed here since mode_switch_confirm() must suspend it.
+ */
+extern const k_tid_t status_led_tid;
+
+static bool mode_switch_confirm(enum device_mode current, enum device_mode target)
+{
+	const struct gpio_dt_spec *current_led = (current == MODE_BLE) ? &led_blue : &led_green;
+	const struct gpio_dt_spec *target_led = (target == MODE_BLE) ? &led_blue : &led_green;
+
+	k_thread_suspend(status_led_tid);
 	gpio_pin_set_dt(&led_red, 0);
+	gpio_pin_set_dt(&led_green, 0);
+	gpio_pin_set_dt(&led_blue, 0);
+
+	/* Phase A: preview the current mode's color. Release cancels. */
+	for (int i = 0; i < MODE_SWITCH_PREVIEW_FLASHES; i++) {
+		gpio_pin_set_dt(current_led, 1);
+		k_sleep(K_MSEC(MODE_SWITCH_FLASH_HALF_PERIOD_MS));
+		if (!mode_button_read()) {
+			gpio_pin_set_dt(current_led, 0);
+			k_thread_resume(status_led_tid);
+			return false;
+		}
+
+		gpio_pin_set_dt(current_led, 0);
+		k_sleep(K_MSEC(MODE_SWITCH_FLASH_HALF_PERIOD_MS));
+		if (!mode_button_read()) {
+			k_thread_resume(status_led_tid);
+			return false;
+		}
+	}
+
+	/* Phase B: preview the target mode's color. Release commits. Held
+	 * indefinitely otherwise - no timeout.
+	 */
+	while (mode_button_read()) {
+		gpio_pin_set_dt(target_led, 1);
+		k_sleep(K_MSEC(MODE_SWITCH_FLASH_HALF_PERIOD_MS));
+		gpio_pin_set_dt(target_led, 0);
+		k_sleep(K_MSEC(MODE_SWITCH_FLASH_HALF_PERIOD_MS));
+	}
+
+	/* Released while showing the target color - commit. Leave the
+	 * background thread suspended; main() reboots right after this
+	 * returns true.
+	 */
+	return true;
 }
 
 #define STATUS_LED_THREAD_STACK_SIZE 512
@@ -962,6 +1028,14 @@ int main(void)
 	 * about to reboot into a different mode anyway, is what actually
 	 * makes the button responsive.
 	 */
+	/* Configured unconditionally and early, regardless of storage/mode
+	 * outcome below - the confirmation gesture (and the background status
+	 * LED thread) both need the LEDs ready as outputs before anything
+	 * else touches them.
+	 */
+	(void)status_led_init();
+	mode_button_init();
+
 	err = mode_storage_init();
 	if (err) {
 		/* Can't safely honor a MODE button press without durable
@@ -975,21 +1049,26 @@ int main(void)
 	} else {
 		mode = mode_load();
 
-		if (mode_button_is_held()) {
+		if (mode_button_read()) {
 			enum device_mode next = (mode == MODE_BLE) ? MODE_THREAD : MODE_BLE;
 
-			LOG_INF("MODE button held at boot: switching %s -> %s",
+			LOG_INF("MODE button held at boot: previewing %s -> %s",
 				mode_name(mode), mode_name(next));
 
-			err = mode_store(next);
-			if (err) {
-				LOG_ERR("Failed to persist new mode (err %d); staying in %s",
-					err, mode_name(mode));
+			if (mode_switch_confirm(mode, next)) {
+				err = mode_store(next);
+				if (err) {
+					LOG_ERR("Failed to persist new mode (err %d); staying in %s",
+						err, mode_name(mode));
+				} else {
+					LOG_INF("Confirmed - rebooting to apply %s...",
+						mode_name(next));
+					sys_reboot(SYS_REBOOT_COLD);
+					/* unreachable */
+				}
 			} else {
-				LOG_INF("Rebooting to apply %s...", mode_name(next));
-				status_led_flash_mode_switch();
-				sys_reboot(SYS_REBOOT_COLD);
-				/* unreachable */
+				LOG_INF("Released during preview - staying in %s",
+					mode_name(mode));
 			}
 		}
 	}
