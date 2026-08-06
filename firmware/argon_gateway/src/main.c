@@ -43,7 +43,8 @@
  *   3. Shared telemetry JSON emission - one JSON-line emitter, both modes
  *   4. Mode 1: BLE central           - scan/connect/discover/subscribe
  *   5. Mode 2: Thread listener       - network join, UDP multicast receive
- *   6. Entry point                   - mode load/switch, stack bring-up
+ *   6. Status LED                    - visual mode/connection/switch readout
+ *   7. Entry point                   - mode load/switch, stack bring-up
  *
  * Concurrency note: Mode 1's BLE work all happens on Zephyr's Bluetooth
  * host callbacks/system workqueue (no hand-rolled thread), same as the
@@ -323,6 +324,14 @@ static const struct bt_uuid_128 xenon_chr_uuid =
 
 static struct bt_conn *default_conn;
 
+/* Set true once GATT discovery actually finds and subscribes to the
+ * telemetry characteristic (not merely "BLE connected"), and read by the
+ * status LED thread in section 6. A raw bt_conn pointer isn't enough on its
+ * own to mean "connected" for LED purposes - discovery can still be
+ * in-flight or fail.
+ */
+static bool ble_connected;
+
 static struct bt_gatt_discover_params discover_params;
 static struct bt_gatt_subscribe_params subscribe_params;
 
@@ -419,6 +428,7 @@ static uint8_t discover_func(struct bt_conn *conn,
 		LOG_ERR("Subscribe to telemetry characteristic failed (err %d)", err);
 	} else {
 		LOG_INF("Subscribed to telemetry notifications");
+		ble_connected = true;
 	}
 
 	return BT_GATT_ITER_STOP;
@@ -613,6 +623,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		bt_hci_err_to_str(reason));
 
 	bt_conn_drop(&default_conn);
+	ble_connected = false;
 
 	/* Clear stale discovery/subscribe state before scanning for a new
 	 * peripheral (or a reconnect of the same one).
@@ -687,6 +698,11 @@ static int thread_udp_sock = -1;
  * OpenThread: DETACHED -> CHILD/ROUTER/LEADER means attached. Copied from
  * xenon_sensor's thread_state_changed().
  */
+/* Read by the status LED thread in section 6 to distinguish "still joining"
+ * from "attached to the mesh".
+ */
+static bool thread_attached;
+
 static void thread_state_changed(otChangedFlags flags, void *context)
 {
 	ARG_UNUSED(context);
@@ -706,12 +722,15 @@ static void thread_state_changed(otChangedFlags flags, void *context)
 	case OT_DEVICE_ROLE_LEADER:
 		LOG_INF("Thread network join/attach succeeded (role=%s)",
 			otThreadDeviceRoleToString(role));
+		thread_attached = true;
 		break;
 	case OT_DEVICE_ROLE_DETACHED:
 		LOG_WRN("Thread network detached; still attempting to (re)join");
+		thread_attached = false;
 		break;
 	case OT_DEVICE_ROLE_DISABLED:
 	default:
+		thread_attached = false;
 		break;
 	}
 }
@@ -908,7 +927,108 @@ K_THREAD_DEFINE(thread_rx_tid, THREAD_RX_THREAD_STACK_SIZE, thread_rx_thread_ent
 		 NULL, NULL, NULL, THREAD_RX_THREAD_PRIORITY, 0, 0);
 
 /* ===========================================================================
- * 6. Entry point
+ * 6. Status LED
+ * ===========================================================================
+ * RGB status LED (status_red/status_green/status_blue = led1/led2/led3 in
+ * this board's devicetree) gives a visual readout of mode and connection
+ * state, driven by its own lightweight thread rather than scattering
+ * gpio_pin_set() calls through the mode-specific code above - one place
+ * owns LED state, polling the ble_connected/thread_attached flags those
+ * sections already maintain.
+ *
+ *   Blinking blue  : Mode 1 (BLE), scanning / not yet connected+subscribed
+ *   Solid blue     : Mode 1 (BLE), connected and subscribed
+ *   Blinking green : Mode 2 (Thread), joining / not yet attached
+ *   Solid green    : Mode 2 (Thread), attached to the mesh
+ *   Rapid red flash: MODE button press detected, switching now (blocking,
+ *                     called directly from main() right before the reboot -
+ *                     see thread_status_flash_mode_switch() below)
+ */
+
+static const struct gpio_dt_spec led_red = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
+static const struct gpio_dt_spec led_green = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
+static const struct gpio_dt_spec led_blue = GPIO_DT_SPEC_GET(DT_ALIAS(led3), gpios);
+
+#define STATUS_LED_POLL_MS 400
+
+static int status_led_init(void)
+{
+	const struct gpio_dt_spec *leds[] = {&led_red, &led_green, &led_blue};
+
+	for (size_t i = 0; i < ARRAY_SIZE(leds); i++) {
+		if (!gpio_is_ready_dt(leds[i])) {
+			LOG_ERR("Status LED %u GPIO not ready", (unsigned int)i);
+			return -ENODEV;
+		}
+
+		int err = gpio_pin_configure_dt(leds[i], GPIO_OUTPUT_INACTIVE);
+
+		if (err) {
+			LOG_ERR("Failed to configure status LED %u (err %d)", (unsigned int)i, err);
+			return err;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * Blocking rapid red flash confirming a MODE button press was actually
+ * registered, called directly from main() right before mode_store()+reboot -
+ * not from the status LED thread, since the device is about to reset anyway
+ * and this needs to be visible right at the moment of the press, not on the
+ * next poll tick.
+ */
+static void status_led_flash_mode_switch(void)
+{
+	gpio_pin_set_dt(&led_blue, 0);
+	gpio_pin_set_dt(&led_green, 0);
+
+	for (int i = 0; i < 6; i++) {
+		gpio_pin_set_dt(&led_red, i % 2);
+		k_sleep(K_MSEC(120));
+	}
+	gpio_pin_set_dt(&led_red, 0);
+}
+
+#define STATUS_LED_THREAD_STACK_SIZE 512
+#define STATUS_LED_THREAD_PRIORITY 10 /* Low priority - purely cosmetic, never block real work */
+
+static void status_led_thread_entry(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	bool blink_phase = false;
+
+	if (status_led_init()) {
+		return;
+	}
+
+	while (1) {
+		bool connected = (current_mode == MODE_BLE) ? ble_connected : thread_attached;
+		const struct gpio_dt_spec *led = (current_mode == MODE_BLE) ? &led_blue : &led_green;
+
+		gpio_pin_set_dt(&led_red, 0);
+		gpio_pin_set_dt((current_mode == MODE_BLE) ? &led_green : &led_blue, 0);
+
+		if (connected) {
+			gpio_pin_set_dt(led, 1);
+		} else {
+			blink_phase = !blink_phase;
+			gpio_pin_set_dt(led, blink_phase);
+		}
+
+		k_sleep(K_MSEC(STATUS_LED_POLL_MS));
+	}
+}
+
+K_THREAD_DEFINE(status_led_tid, STATUS_LED_THREAD_STACK_SIZE, status_led_thread_entry,
+		 NULL, NULL, NULL, STATUS_LED_THREAD_PRIORITY, 0, 0);
+
+/* ===========================================================================
+ * 7. Entry point
  * ===========================================================================
  * main() resolves the mode (checking the MODE button first), then brings up
  * exactly one radio stack. All recurring work happens on Bluetooth host
@@ -974,11 +1094,7 @@ int main(void)
 					err, mode_name(mode));
 			} else {
 				LOG_INF("Rebooting to apply %s...", mode_name(next));
-				/* Give the log backend a moment to flush the
-				 * message above over the console UART before
-				 * the reset tears everything down.
-				 */
-				k_sleep(K_MSEC(50));
+				status_led_flash_mode_switch();
 				sys_reboot(SYS_REBOOT_COLD);
 				/* unreachable */
 			}
