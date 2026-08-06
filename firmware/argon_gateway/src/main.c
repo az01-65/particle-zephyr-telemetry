@@ -1067,8 +1067,14 @@ int main(void)
 	int err;
 	enum device_mode mode;
 
-	wait_for_console_dtr();
-
+	/* Deliberately NOT gated behind wait_for_console_dtr() -- that wait
+	 * can block up to CONSOLE_DTR_WAIT_TIMEOUT_MS (3s), and the MODE
+	 * button needs to be sampled immediately at boot to match a user
+	 * physically holding it for only ~1s around the reset. Checking the
+	 * button first, then waiting for DTR only once we know we're not
+	 * about to reboot into a different mode anyway, is what actually
+	 * makes the button responsive.
+	 */
 	err = mode_storage_init();
 	if (err) {
 		/* Can't safely honor a MODE button press without durable
@@ -1102,6 +1108,14 @@ int main(void)
 	}
 
 	current_mode = mode;
+
+	/* Only now, once we know we're actually proceeding to bring up a
+	 * radio stack rather than rebooting, is it worth waiting for a host
+	 * to have the console open -- so the boot log for whichever mode we
+	 * land in isn't dropped.
+	 */
+	wait_for_console_dtr();
+
 	LOG_INF("Booting in %s", mode_name(mode));
 
 	if (mode == MODE_BLE) {

@@ -31,8 +31,9 @@
  *   3. Shared sensor sampling       - die-temp + VDD read, used by both modes
  *   4. Mode 1: BLE                  - GATT service, advertising, connections
  *   5. Mode 2: Thread                - network join, UDP multicast send
- *   6. Sampling thread               - shared loop, dispatches by mode
- *   7. Entry point                   - mode load/switch, stack bring-up
+ *   6. Status LED                    - visual mode/connection/switch readout
+ *   7. Sampling thread               - shared loop, dispatches by mode
+ *   8. Entry point                   - mode load/switch, stack bring-up
  *
  * Concurrency/power notes carried over from the original BLE-only version
  * still apply: sensor sampling runs on its own K_THREAD_DEFINE() thread,
@@ -486,6 +487,11 @@ static const struct bt_data sd[] = {
 
 static struct bt_conn *current_conn;
 
+/* Read by the status LED thread (section 6) - true once a central has
+ * connected, regardless of whether it's subscribed to notifications yet.
+ */
+static bool ble_connected;
+
 static int start_advertising(void)
 {
 	int err;
@@ -508,6 +514,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	}
 
 	current_conn = bt_conn_ref(conn);
+	ble_connected = true;
 	LOG_INF("Central connected");
 }
 
@@ -519,6 +526,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		bt_conn_unref(current_conn);
 		current_conn = NULL;
 	}
+	ble_connected = false;
 	notifications_enabled = false;
 
 	/* Only re-enter advertising state now that we're actually alone
@@ -599,6 +607,9 @@ static struct net_sockaddr_in6 thread_telemetry_dst;
  * transitions, which is what "joined the network" boils down to in
  * OpenThread: DETACHED -> CHILD/ROUTER/LEADER means attached.
  */
+/* Read by the status LED thread (section 6). */
+static bool thread_attached;
+
 static void thread_state_changed(otChangedFlags flags, void *context)
 {
 	ARG_UNUSED(context);
@@ -618,12 +629,15 @@ static void thread_state_changed(otChangedFlags flags, void *context)
 	case OT_DEVICE_ROLE_LEADER:
 		LOG_INF("Thread network join/attach succeeded (role=%s)",
 			otThreadDeviceRoleToString(role));
+		thread_attached = true;
 		break;
 	case OT_DEVICE_ROLE_DETACHED:
 		LOG_WRN("Thread network detached; still attempting to (re)join");
+		thread_attached = false;
 		break;
 	case OT_DEVICE_ROLE_DISABLED:
 	default:
+		thread_attached = false;
 		break;
 	}
 }
@@ -713,7 +727,102 @@ static void thread_send_telemetry(const struct telemetry_payload *payload)
 }
 
 /* ===========================================================================
- * 6. Sampling thread
+ * 6. Status LED
+ * ===========================================================================
+ * RGB status LED (status_red/status_green/status_blue = led1/led2/led3 in
+ * this board's devicetree) gives a visual readout of mode and connection
+ * state, driven by its own lightweight thread - mirrors argon_gateway's
+ * identical section, see that file for the fuller rationale.
+ *
+ *   Blinking blue  : Mode 1 (BLE), advertising / not yet connected
+ *   Solid blue     : Mode 1 (BLE), a central is connected
+ *   Blinking green : Mode 2 (Thread), joining / not yet attached
+ *   Solid green    : Mode 2 (Thread), attached to the mesh
+ *   Rapid red flash: MODE button press detected, switching now (blocking,
+ *                     called directly from main() right before the reboot)
+ */
+
+static const struct gpio_dt_spec led_red = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
+static const struct gpio_dt_spec led_green = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
+static const struct gpio_dt_spec led_blue = GPIO_DT_SPEC_GET(DT_ALIAS(led3), gpios);
+
+#define STATUS_LED_POLL_MS 400
+
+static int status_led_init(void)
+{
+	const struct gpio_dt_spec *leds[] = {&led_red, &led_green, &led_blue};
+
+	for (size_t i = 0; i < ARRAY_SIZE(leds); i++) {
+		if (!gpio_is_ready_dt(leds[i])) {
+			LOG_ERR("Status LED %u GPIO not ready", (unsigned int)i);
+			return -ENODEV;
+		}
+
+		int err = gpio_pin_configure_dt(leds[i], GPIO_OUTPUT_INACTIVE);
+
+		if (err) {
+			LOG_ERR("Failed to configure status LED %u (err %d)", (unsigned int)i, err);
+			return err;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * Blocking rapid red flash confirming a MODE button press was actually
+ * registered, called directly from main() right before mode_store()+reboot.
+ */
+static void status_led_flash_mode_switch(void)
+{
+	gpio_pin_set_dt(&led_blue, 0);
+	gpio_pin_set_dt(&led_green, 0);
+
+	for (int i = 0; i < 6; i++) {
+		gpio_pin_set_dt(&led_red, i % 2);
+		k_sleep(K_MSEC(120));
+	}
+	gpio_pin_set_dt(&led_red, 0);
+}
+
+#define STATUS_LED_THREAD_STACK_SIZE 512
+#define STATUS_LED_THREAD_PRIORITY 10 /* Low priority - purely cosmetic, never block real work */
+
+static void status_led_thread_entry(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	bool blink_phase = false;
+
+	if (status_led_init()) {
+		return;
+	}
+
+	while (1) {
+		bool connected = (current_mode == MODE_BLE) ? ble_connected : thread_attached;
+		const struct gpio_dt_spec *led = (current_mode == MODE_BLE) ? &led_blue : &led_green;
+
+		gpio_pin_set_dt(&led_red, 0);
+		gpio_pin_set_dt((current_mode == MODE_BLE) ? &led_green : &led_blue, 0);
+
+		if (connected) {
+			gpio_pin_set_dt(led, 1);
+		} else {
+			blink_phase = !blink_phase;
+			gpio_pin_set_dt(led, blink_phase);
+		}
+
+		k_sleep(K_MSEC(STATUS_LED_POLL_MS));
+	}
+}
+
+K_THREAD_DEFINE(status_led_tid, STATUS_LED_THREAD_STACK_SIZE, status_led_thread_entry,
+		 NULL, NULL, NULL, STATUS_LED_THREAD_PRIORITY, 0, 0);
+
+/* ===========================================================================
+ * 7. Sampling thread
  * ===========================================================================
  * Runs as its own K_THREAD_DEFINE() context - not the system workqueue, not
  * inline in main(). This keeps sensor I/O and telemetry cadence fully
@@ -806,7 +915,7 @@ K_THREAD_DEFINE(sampling_tid, SAMPLING_THREAD_STACK_SIZE, sampling_thread_entry,
 		 NULL, NULL, NULL, SAMPLING_THREAD_PRIORITY, 0, 0);
 
 /* ===========================================================================
- * 7. Entry point
+ * 8. Entry point
  * ===========================================================================
  * main() resolves the mode (checking the MODE button first), then brings up
  * exactly one radio stack, then hands off to the sampling thread above. All
@@ -845,8 +954,14 @@ int main(void)
 	int err;
 	enum device_mode mode;
 
-	wait_for_console_dtr();
-
+	/* Deliberately NOT gated behind wait_for_console_dtr() -- that wait
+	 * can block up to CONSOLE_DTR_WAIT_TIMEOUT_MS (3s), and the MODE
+	 * button needs to be sampled immediately at boot to match a user
+	 * physically holding it for only ~1s around the reset. Checking the
+	 * button first, then waiting for DTR only once we know we're not
+	 * about to reboot into a different mode anyway, is what actually
+	 * makes the button responsive.
+	 */
 	err = mode_storage_init();
 	if (err) {
 		/* Can't safely honor a MODE button press without durable
@@ -872,11 +987,7 @@ int main(void)
 					err, mode_name(mode));
 			} else {
 				LOG_INF("Rebooting to apply %s...", mode_name(next));
-				/* Give the log backend a moment to flush the
-				 * message above over the console UART before
-				 * the reset tears everything down.
-				 */
-				k_sleep(K_MSEC(50));
+				status_led_flash_mode_switch();
 				sys_reboot(SYS_REBOOT_COLD);
 				/* unreachable */
 			}
@@ -884,6 +995,14 @@ int main(void)
 	}
 
 	current_mode = mode;
+
+	/* Only now, once we know we're actually proceeding to bring up a
+	 * radio stack rather than rebooting, is it worth waiting for a host
+	 * to have the console open -- so the boot log for whichever mode we
+	 * land in isn't dropped.
+	 */
+	wait_for_console_dtr();
+
 	LOG_INF("Booting in %s", mode_name(mode));
 
 	if (mode == MODE_BLE) {
