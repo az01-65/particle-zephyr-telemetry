@@ -1,63 +1,74 @@
 /*
- * argon_gateway - BLE central "gateway" firmware for the Particle Argon
+ * argon_gateway - dual-mode telemetry gateway for the Particle Argon
  * (Nordic nRF52840).
  *
  * SPDX-License-Identifier: Apache-2.0
  *
- * Role in the two-board demo
- * ---------------------------------------------------------------------
- * This board is the BLE GATT *central*. It never advertises and never
- * accepts inbound connections (CONFIG_BT_PERIPHERAL is deliberately left
- * off) -- it only scans, connects out, discovers, and subscribes. The
- * counterpart board (xenon_sensor) is the GATT *peripheral*: it samples a
- * sensor on a dedicated RTOS thread and notifies readings over BLE. This
- * app's BLE work all happens on Zephyr's Bluetooth host callbacks/system
- * workqueue, so there's no hand-rolled thread here (unlike xenon_sensor's
- * explicit sampling thread) -- that's a deliberate concurrency choice, not
- * an oversight.
+ * -----------------------------------------------------------------------
+ * Architecture, for the reviewer
+ * -----------------------------------------------------------------------
+ * This firmware boots into one of two mutually exclusive radio modes,
+ * mirroring the exact pattern already built and proven on the sibling
+ * xenon_sensor app (see firmware/xenon_sensor/src/main.c):
  *
- * The Argon's onboard ESP32 Wi-Fi co-processor (attached via &uart1 in the
- * board's devicetree) is entirely out of scope for this app: BLE only.
+ *   Mode 1 (BLE):    a GATT central that scans for, connects to, and
+ *                     subscribes to xenon_sensor's telemetry
+ *                     characteristic, then relays each notification as a
+ *                     JSON line on the USB-CDC console. This is the
+ *                     original (and, until now, only) argon_gateway
+ *                     behavior, unchanged.
+ *   Mode 2 (Thread):  an 802.15.4/Thread node that joins the same Thread
+ *                     network xenon_sensor's Mode 2 joins, subscribes to
+ *                     its UDP telemetry multicast group, and relays each
+ *                     received datagram as the exact same JSON line
+ *                     format -- so tools/telemetry_monitor.py needs zero
+ *                     changes regardless of which mode either board is
+ *                     running.
  *
- * Wire format design note
- * ---------------------------------------------------------------------
- * Two different serialization formats are used on purpose, one per link:
+ * Why a reboot is required to switch: the nRF52840 has a single 2.4GHz
+ * radio. BLE and 802.15.4/Thread both want it, and Zephyr's BLE controller
+ * and the 802.15.4 driver both want the same RADIO_IRQn vector - they
+ * cannot usefully run at the same time on this hardware. So instead of
+ * attempting to hot-swap radio stacks, the selected mode is persisted to
+ * flash (NVS) and read once at boot; only that mode's stack is ever
+ * started. Switching modes is a deliberate, explicit action (hold the
+ * MODE button at boot) followed by a reboot - not a limitation to work
+ * around, but the honest shape of the hardware constraint. This is
+ * identical reasoning to xenon_sensor's, copied here rather than
+ * re-derived, since it's the same SoC hitting the same constraint.
  *
- *   - BLE notification payload: a tight 8-byte packed little-endian binary
- *     struct (struct telemetry_payload below). The radio link is bandwidth-
- *     and power-constrained, so every byte on the air matters.
+ * Section map:
+ *   1. Wire format                  - shared 8-byte telemetry struct
+ *   2. Mode selection                - persisted mode, MODE button handling
+ *   3. Shared telemetry JSON emission - one JSON-line emitter, both modes
+ *   4. Mode 1: BLE central           - scan/connect/discover/subscribe
+ *   5. Mode 2: Thread listener       - network join, UDP multicast receive
+ *   6. Entry point                   - mode load/switch, stack bring-up
  *
- *   - USB serial (this board -> host PC): a JSON line
- *     ({"temp_c": 23.50, "vdd_mv": 3300, "seq": 12}\n). The serial link to a
- *     development host is comparatively unconstrained, and JSON is trivial
- *     for tools/telemetry_monitor.py (a plain Python script) to parse
- *     without any custom binary decoding on that side. Re-encoding at this
- *     boundary is the right tradeoff in both directions.
- *
- * USB-CDC / console note
- * ---------------------------------------------------------------------
- * particle_argon's board defconfig (particle_argon_defconfig) already turns
- * on CONFIG_SERIAL, CONFIG_CONSOLE, and CONFIG_UART_CONSOLE unconditionally,
- * and the upstream board devicetree (particle_argon.dts) does not define a
- * USB CDC-ACM node or a "zephyr,console" chosen override. That means
- * enabling CONFIG_USB_DEVICE_STACK/CONFIG_USB_CDC_ACM from this app's
- * prj.conf alone would be dead configuration (Kconfig can't fabricate the
- * devicetree node a CDC-ACM console needs), and doing it properly would
- * require a devicetree overlay outside this app's scope. So printk() below
- * rides the board's already-enabled standard console UART path rather than
- * duplicating/fighting the board defaults -- see prj.conf for the same note.
+ * Concurrency note: Mode 1's BLE work all happens on Zephyr's Bluetooth
+ * host callbacks/system workqueue (no hand-rolled thread), same as the
+ * original BLE-only argon_gateway. Mode 2's UDP receive loop runs on its
+ * own dedicated K_THREAD_DEFINE() thread, consistent with how xenon_sensor
+ * keeps its sampling thread separate from main()/radio-stack threads.
  */
 
+#include <errno.h>
 #include <string.h>
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
-#include <zephyr/drivers/uart.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/util.h>
-#include <zephyr/logging/log.h>
+#include <zephyr/sys/reboot.h>
+
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/flash.h>
+#include <zephyr/drivers/uart.h>
+
+#include <zephyr/kvss/nvs.h>
+#include <zephyr/storage/flash_map.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/hci.h>
@@ -66,11 +77,229 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/att.h>
 
+#include <zephyr/net/openthread.h>
+#include <zephyr/net/socket.h>
+#include <openthread/thread.h>
+#include <openthread/instance.h>
+
+#include <zephyr/logging/log.h>
+
 LOG_MODULE_REGISTER(argon_gateway, LOG_LEVEL_INF);
 
 /* ===========================================================================
- * Protocol spec (shared byte-for-byte with the xenon_sensor peripheral)
+ * 1. Wire format - shared byte-for-byte with xenon_sensor, on both the BLE
+ *    notification payload (Mode 1) and the Thread UDP multicast payload
+ *    (Mode 2). See xenon_sensor/src/main.c section 1 for the canonical
+ *    definition this is copied from.
  * ===========================================================================
+ */
+struct __packed telemetry_payload {
+	int16_t temp_centi_c;  /* hundredths of a degree C */
+	uint16_t vdd_mv;        /* millivolts */
+	uint32_t seq;            /* monotonic sample counter */
+};
+
+BUILD_ASSERT(sizeof(struct telemetry_payload) == 8,
+	     "telemetry_payload must match the 8-byte wire format on both links");
+
+/* ===========================================================================
+ * 2. Mode selection
+ * ===========================================================================
+ * Copied as closely as possible from xenon_sensor/src/main.c section 2 -
+ * same NVS-backed storage_partition, same persisted key, same MODE button
+ * alias, same one-shot poll-at-boot semantics. See that file for the full
+ * design rationale; only the two mode names differ in meaning (BLE central
+ * vs. BLE peripheral, Thread listener vs. Thread sender) but not in
+ * mechanism.
+ */
+
+enum device_mode {
+	MODE_BLE = 0,
+	MODE_THREAD = 1,
+};
+
+#define MODE_NVS_ID 1U
+
+static struct nvs_fs mode_fs;
+
+/* Set once in main() before either mode's stack is brought up, and only
+ * ever read afterward - no lock needed.
+ */
+static enum device_mode current_mode;
+
+/**
+ * Mount the NVS file system used to persist the mode selection, sized off
+ * the storage partition's real flash geometry rather than a guessed
+ * constant.
+ */
+static int mode_storage_init(void)
+{
+	int err;
+	struct flash_pages_info info;
+
+	mode_fs.flash_device = PARTITION_DEVICE(storage_partition);
+	if (!device_is_ready(mode_fs.flash_device)) {
+		LOG_ERR("Storage partition flash device not ready");
+		return -ENODEV;
+	}
+
+	mode_fs.offset = PARTITION_OFFSET(storage_partition);
+
+	err = flash_get_page_info_by_offs(mode_fs.flash_device, mode_fs.offset, &info);
+	if (err) {
+		LOG_ERR("Unable to read flash page info for storage partition (err %d)", err);
+		return err;
+	}
+
+	mode_fs.sector_size = info.size;
+	/* Two sectors is the minimum NVS recommends for garbage collection to
+	 * have somewhere to compact into; a single persisted byte will never
+	 * come close to filling either one.
+	 */
+	mode_fs.sector_count = 2U;
+
+	return nvs_mount(&mode_fs);
+}
+
+/**
+ * Load the persisted mode. Defaults to (and persists) Mode 1/BLE the first
+ * time this runs on a device, or if the stored value is missing/corrupt.
+ */
+static enum device_mode mode_load(void)
+{
+	uint8_t stored;
+	ssize_t rc = nvs_read(&mode_fs, MODE_NVS_ID, &stored, sizeof(stored));
+
+	if (rc == (ssize_t)sizeof(stored) && stored <= MODE_THREAD) {
+		return (enum device_mode)stored;
+	}
+
+	LOG_INF("No valid persisted mode found; defaulting to Mode 1 (BLE)");
+	stored = MODE_BLE;
+	(void)nvs_write(&mode_fs, MODE_NVS_ID, &stored, sizeof(stored));
+
+	return MODE_BLE;
+}
+
+/** Persist a mode selection. */
+static int mode_store(enum device_mode mode)
+{
+	uint8_t value = (uint8_t)mode;
+	ssize_t rc = nvs_write(&mode_fs, MODE_NVS_ID, &value, sizeof(value));
+
+	return (rc < 0) ? (int)rc : 0;
+}
+
+static const char *mode_name(enum device_mode mode)
+{
+	return (mode == MODE_BLE) ? "Mode 1 (BLE)" : "Mode 2 (Thread)";
+}
+
+/* MODE button ("sw0" in this board's devicetree - see mesh_feather.dtsi,
+ * shared by particle_argon/boron/xenon, where sw0 = &mode_button). Read as
+ * a plain GPIO rather than through the input subsystem, matching the
+ * pattern used for this exact alias in
+ * zephyr/samples/net/openthread/coap/src/button.c in this checkout, and in
+ * xenon_sensor's own mode_button_is_held().
+ */
+#define MODE_BUTTON_NODE DT_ALIAS(sw0)
+#if !DT_NODE_HAS_STATUS_OKAY(MODE_BUTTON_NODE)
+#error "particle_argon devicetree is missing the sw0 (MODE button) alias"
+#endif
+static const struct gpio_dt_spec mode_button = GPIO_DT_SPEC_GET(MODE_BUTTON_NODE, gpios);
+
+/**
+ * Fast, one-shot poll of the MODE button at boot. Deliberately not
+ * interrupt-driven or debounced with a delay loop - by the time main() runs
+ * this early, a physically held button reads as a stable level, and this
+ * needs to stay quick since it sits ahead of everything else in main().
+ *
+ * gpio_pin_get_dt() already accounts for GPIO_ACTIVE_LOW from the
+ * devicetree, so a return value of 1 means "pressed" regardless of the
+ * button's electrical polarity.
+ */
+static bool mode_button_is_held(void)
+{
+	int err;
+
+	if (!gpio_is_ready_dt(&mode_button)) {
+		LOG_ERR("MODE button GPIO not ready; assuming not held");
+		return false;
+	}
+
+	err = gpio_pin_configure_dt(&mode_button, GPIO_INPUT);
+	if (err) {
+		LOG_ERR("Failed to configure MODE button pin (err %d); assuming not held", err);
+		return false;
+	}
+
+	return gpio_pin_get_dt(&mode_button) == 1;
+}
+
+/* ===========================================================================
+ * 3. Shared telemetry JSON emission
+ * ===========================================================================
+ * A single decode-and-print helper used by both modes so the on-the-wire
+ * -> JSON translation only exists in one place, rather than being
+ * duplicated (and risking drift) between the BLE notify handler and the
+ * Thread UDP receive loop. Both wire formats carry the identical 8-byte
+ * little-endian struct telemetry_payload, so one decoder covers both.
+ */
+
+/**
+ * Decode a raw 8-byte little-endian telemetry_payload buffer and print it
+ * as a JSON line on the USB-CDC console, in the exact format
+ * tools/telemetry_monitor.py already expects:
+ *
+ *   {"temp_c": 23.50, "vdd_mv": 3300, "seq": 12}
+ *
+ * @param data   Pointer to at least sizeof(struct telemetry_payload) bytes.
+ * @param length Length of the buffer at data, in bytes.
+ * @param source Short tag identifying the origin link, for the LOG_INF
+ *               breadcrumb only (not part of the JSON output).
+ */
+static void telemetry_emit_json(const void *data, size_t length, const char *source)
+{
+	struct telemetry_payload payload;
+
+	if (length != sizeof(payload)) {
+		LOG_WRN("Dropping %s payload with unexpected length %u (expected %u)",
+			source, (unsigned int)length, (unsigned int)sizeof(payload));
+		return;
+	}
+
+	/* Decode the packed little-endian struct field-by-field rather than
+	 * trusting host struct layout/endianness to match the wire exactly.
+	 * The nRF52840 is little-endian, so this is a no-op here in practice,
+	 * but being explicit keeps the decode correct if this code is ever
+	 * reused on a big-endian host.
+	 */
+	memcpy(&payload, data, sizeof(payload));
+
+	int16_t temp_centi_c = (int16_t)sys_le16_to_cpu((uint16_t)payload.temp_centi_c);
+	uint16_t vdd_mv = sys_le16_to_cpu(payload.vdd_mv);
+	uint32_t seq = sys_le32_to_cpu(payload.seq);
+
+	float temp_c = (float)temp_centi_c / 100.0f;
+
+	/* JSON on USB serial for tools/telemetry_monitor.py -- identical
+	 * format regardless of which mode/link produced this sample.
+	 */
+	printk("{\"temp_c\": %.2f, \"vdd_mv\": %u, \"seq\": %u}\n",
+	       (double)temp_c, vdd_mv, seq);
+
+	LOG_INF("Telemetry from %s: temp=%.2fC vdd=%umV seq=%u",
+		source, (double)temp_c, vdd_mv, seq);
+}
+
+/* ===========================================================================
+ * 4. Mode 1: BLE central
+ * ===========================================================================
+ * Unchanged from the original BLE-only argon_gateway, except that
+ * bt_enable()/start_scan() are now only ever invoked from main() when
+ * current_mode == MODE_BLE (see section 6), and notify_func() now calls the
+ * shared telemetry_emit_json() helper from section 3 instead of decoding
+ * and printing inline.
  */
 
 /* a3f8c2d0-6b1e-4a7f-9c3d-8e2b5f1a9d40 */
@@ -92,23 +321,6 @@ static const struct bt_uuid_128 xenon_chr_uuid =
  */
 #define XENON_DEVICE_NAME "XenonSensor"
 
-/* Exact wire layout of a single BLE notification payload. Must stay
- * byte-for-byte identical to the peripheral firmware's definition.
- */
-struct __packed telemetry_payload {
-	int16_t temp_centi_c;  /* hundredths of a degree C */
-	uint16_t vdd_mv;        /* millivolts */
-	uint32_t seq;            /* monotonic sample counter */
-};
-
-BUILD_ASSERT(sizeof(struct telemetry_payload) == 8,
-	     "telemetry_payload must match the 8-byte BLE wire format");
-
-/* ===========================================================================
- * BLE central state
- * ===========================================================================
- */
-
 static struct bt_conn *default_conn;
 
 static struct bt_gatt_discover_params discover_params;
@@ -124,15 +336,6 @@ static struct bt_uuid_16 ccc_uuid = BT_UUID_INIT_16(BT_UUID_GATT_CCC_VAL);
 static void start_scan(void);
 static void start_discovery(struct bt_conn *conn);
 
-/* ===========================================================================
- * Notification handling / serial output
- *
- * Decodes each BLE notification's packed binary payload and re-emits it as
- * a JSON line on the USB serial console. Kept separate from the
- * scan/connect/discover logic below.
- * ===========================================================================
- */
-
 static uint8_t notify_func(struct bt_conn *conn,
 			    struct bt_gatt_subscribe_params *params,
 			    const void *data, uint16_t length)
@@ -145,36 +348,7 @@ static uint8_t notify_func(struct bt_conn *conn,
 		return BT_GATT_ITER_STOP;
 	}
 
-	if (length != sizeof(struct telemetry_payload)) {
-		LOG_WRN("Dropping notification with unexpected length %u (expected %u)",
-			length, (unsigned int)sizeof(struct telemetry_payload));
-		return BT_GATT_ITER_CONTINUE;
-	}
-
-	/* Decode the packed little-endian struct field-by-field rather than
-	 * trusting host struct layout/endianness to match the wire exactly.
-	 * The nRF52840 is little-endian, so this is a no-op here in practice,
-	 * but being explicit keeps the decode correct if this code is ever
-	 * reused on a big-endian host.
-	 */
-	struct telemetry_payload payload;
-
-	memcpy(&payload, data, sizeof(payload));
-
-	int16_t temp_centi_c = (int16_t)sys_le16_to_cpu((uint16_t)payload.temp_centi_c);
-	uint16_t vdd_mv = sys_le16_to_cpu(payload.vdd_mv);
-	uint32_t seq = sys_le32_to_cpu(payload.seq);
-
-	float temp_c = (float)temp_centi_c / 100.0f;
-
-	/* JSON on USB serial for tools/telemetry_monitor.py -- see the file
-	 * header comment for why this differs from the BLE wire format.
-	 */
-	printk("{\"temp_c\": %.2f, \"vdd_mv\": %u, \"seq\": %u}\n",
-	       (double)temp_c, vdd_mv, seq);
-
-	LOG_INF("Telemetry notification: temp=%.2fC vdd=%umV seq=%u",
-		(double)temp_c, vdd_mv, seq);
+	telemetry_emit_json(data, length, "BLE");
 
 	return BT_GATT_ITER_CONTINUE;
 }
@@ -276,8 +450,7 @@ static void start_discovery(struct bt_conn *conn)
  * Filtered scan: only devices advertising the telemetry service UUID are
  * connected to. The device name is checked too, but only as a secondary,
  * informational check -- the UUID match is what actually drives the connect
- * decision, per the task spec's guidance that UUID filtering is the more
- * robust of the two.
+ * decision.
  * ===========================================================================
  */
 
@@ -454,15 +627,299 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.disconnected = disconnected,
 };
 
+/**
+ * Bring up Mode 1: enable the Bluetooth host and start scanning. Only ever
+ * called from main() when current_mode == MODE_BLE - this is the one and
+ * only place bt_enable() is called anywhere in this file.
+ */
+static int ble_mode_start(void)
+{
+	int err = bt_enable(NULL);
+
+	if (err) {
+		LOG_ERR("Bluetooth init failed (err %d)", err);
+		return err;
+	}
+
+	LOG_INF("Bluetooth initialized");
+
+	start_scan();
+
+	return 0;
+}
+
 /* ===========================================================================
- * Entry point
+ * 5. Mode 2: Thread listener
  * ===========================================================================
+ * Joins the exact same Thread network xenon_sensor's Mode 2 joins (same
+ * hardcoded credentials, see prj.conf) and subscribes to the UDP multicast
+ * group xenon_sensor's Mode 2 sends telemetry to, then relays each received
+ * datagram as a JSON line via the shared telemetry_emit_json() helper.
+ *
+ * Scope decision, mirroring xenon_sensor's: this is a Thread node that
+ * joins the mesh and listens for multicast telemetry, not a Thread Border
+ * Router. No external IPv6 routing, no NAT64, no infra interface bridging.
+ *
+ * CONFIG_OPENTHREAD_MANUAL_START keeps the network administratively down
+ * until openthread_run() is called explicitly below, so Thread traffic only
+ * ever happens when this mode is selected - mirroring how bt_enable() is
+ * the sole gate for Mode 1's radio activity.
+ */
+
+/* Must match xenon_sensor's THREAD_TELEMETRY_MCAST_ADDR/PORT exactly -- see
+ * xenon_sensor/src/main.c section 5. Realm-local (mesh-wide, not routed
+ * beyond the Thread network) multicast group xenon_sensor's Mode 2 sends
+ * telemetry to.
+ *   Multicast address: ff03::abcd
+ *   Port:               4242
+ */
+#define THREAD_TELEMETRY_MCAST_ADDR "ff03::abcd"
+#define THREAD_TELEMETRY_MCAST_PORT 4242
+
+static int thread_udp_sock = -1;
+
+/**
+ * OpenThread state-changed callback, registered with the module's own
+ * multi-consumer callback list (openthread_state_changed_callback_register)
+ * rather than otSetStateChangedCallback() directly, since that single-slot
+ * API is already claimed internally by the L2 driver. Only handles role
+ * transitions, which is what "joined the network" boils down to in
+ * OpenThread: DETACHED -> CHILD/ROUTER/LEADER means attached. Copied from
+ * xenon_sensor's thread_state_changed().
+ */
+static void thread_state_changed(otChangedFlags flags, void *context)
+{
+	ARG_UNUSED(context);
+
+	if (!(flags & OT_CHANGED_THREAD_ROLE)) {
+		return;
+	}
+
+	otInstance *ot = openthread_get_default_instance();
+	otDeviceRole role = otThreadGetDeviceRole(ot);
+
+	LOG_INF("Thread role changed: %s", otThreadDeviceRoleToString(role));
+
+	switch (role) {
+	case OT_DEVICE_ROLE_CHILD:
+	case OT_DEVICE_ROLE_ROUTER:
+	case OT_DEVICE_ROLE_LEADER:
+		LOG_INF("Thread network join/attach succeeded (role=%s)",
+			otThreadDeviceRoleToString(role));
+		break;
+	case OT_DEVICE_ROLE_DETACHED:
+		LOG_WRN("Thread network detached; still attempting to (re)join");
+		break;
+	case OT_DEVICE_ROLE_DISABLED:
+	default:
+		break;
+	}
+}
+
+static struct openthread_state_changed_callback thread_state_cb = {
+	.otCallback = thread_state_changed,
+};
+
+/**
+ * Join the telemetry multicast group on an already-open UDP socket.
+ *
+ * A plain socket bound to THREAD_TELEMETRY_MCAST_PORT is not enough to
+ * receive multicast traffic -- the network stack only delivers a multicast
+ * datagram to a socket if the destination address is in the *interface's*
+ * list of joined IPv6 multicast addresses. That join is performed via the
+ * ZSOCK_IPV6_ADD_MEMBERSHIP (== ZSOCK_IPV6_JOIN_GROUP) sockopt, exactly the
+ * BSD/POSIX IPV6_ADD_MEMBERSHIP mechanism, taking a struct net_ipv6_mreq.
+ * xenon_sensor's Mode 2 never needed this -- it only sends, and a sender
+ * doesn't join the group it targets.
+ *
+ * Verified against this exact Zephyr checkout's real source, not guessed:
+ *   - include/zephyr/net/socket.h: ZSOCK_IPV6_ADD_MEMBERSHIP (20) /
+ *     ZSOCK_IPV6_JOIN_GROUP alias, and the zsock_setsockopt() declaration.
+ *   - include/zephyr/net/net_ip.h: struct net_ipv6_mreq { ipv6mr_multiaddr,
+ *     ipv6mr_ifindex }.
+ *   - subsys/net/lib/sockets/sockets_inet.c ipv6_multicast_group() /
+ *     zsock_setsockopt_ctx(): ZSOCK_IPV6_ADD_MEMBERSHIP dispatches here,
+ *     which calls net_ipv6_mld_join(iface, &mreq->ipv6mr_multiaddr).
+ *     ipv6mr_ifindex == 0 makes net_if_get_by_index() return NULL (its
+ *     "index <= 0" guard in subsys/net/ip/net_if.c), which falls back to
+ *     this socket's own iface or net_if_get_default() -- exactly what we
+ *     want on a single-interface Thread node, no manual iface lookup
+ *     needed.
+ *   - subsys/net/ip/ipv6_mld.c net_ipv6_mld_join(): registers the address
+ *     via net_if_ipv6_maddr_add() (so the IPv6 receive path will actually
+ *     accept datagrams addressed to it), which fires a
+ *     NET_EVENT_IPV6_MADDR_ADD net_mgmt event unconditionally.
+ *   - subsys/net/l2/openthread/openthread.c /
+ *     subsys/net/l2/openthread/openthread_utils.c: the OpenThread L2 layer
+ *     listens for that exact event and calls
+ *     otIp6SubscribeMulticastAddress() in response (add_ipv6_maddr_to_ot()),
+ *     which is what actually tells the OpenThread mesh stack to accept and
+ *     forward this realm-local multicast group to us. (The OpenThread
+ *     interface also sets NET_IF_IPV6_NO_MLD, so net_ipv6_mld_join() skips
+ *     sending an actual MLDv2 report over the air -- correct, since Thread
+ *     uses its own multicast subscription mechanism, not link-local MLD.)
+ *   - Kconfig.ipv6 NET_IPV6_MLD: defaults to y, but made explicit in
+ *     prj.conf since net_ipv6_mld_join() is a stub returning -ENOTSUP when
+ *     it's off (see include/zephyr/net/mld.h).
+ */
+static int thread_join_multicast_group(int sock)
+{
+	struct net_ipv6_mreq mreq;
+	int err;
+
+	memset(&mreq, 0, sizeof(mreq));
+
+	err = zsock_inet_pton(NET_AF_INET6, THREAD_TELEMETRY_MCAST_ADDR, &mreq.ipv6mr_multiaddr);
+	if (err != 1) {
+		LOG_ERR("Failed to parse multicast address \"%s\"", THREAD_TELEMETRY_MCAST_ADDR);
+		return -EINVAL;
+	}
+	mreq.ipv6mr_ifindex = 0; /* 0 -> fall back to this socket's default iface */
+
+	err = zsock_setsockopt(sock, NET_IPPROTO_IPV6, ZSOCK_IPV6_ADD_MEMBERSHIP,
+				&mreq, sizeof(mreq));
+	if (err) {
+		LOG_ERR("Failed to join multicast group [%s] (errno %d)",
+			THREAD_TELEMETRY_MCAST_ADDR, errno);
+		return -errno;
+	}
+
+	LOG_INF("Joined multicast group [%s]:%d", THREAD_TELEMETRY_MCAST_ADDR,
+		THREAD_TELEMETRY_MCAST_PORT);
+
+	return 0;
+}
+
+/**
+ * Bring up Mode 2: register role-change logging, join the Thread network
+ * (this is the one and only place openthread_run() is called anywhere in
+ * this file), open a UDP socket bound to the telemetry port, and join the
+ * telemetry multicast group on it. Only ever called from main() when
+ * current_mode == MODE_THREAD. The actual receive loop runs on the
+ * dedicated thread in this same section, started unconditionally by
+ * K_THREAD_DEFINE() below but gated on stack_ready_sem the same way
+ * xenon_sensor gates its sampling thread.
+ */
+static int thread_mode_start(void)
+{
+	struct net_sockaddr_in6 local_addr;
+	int err;
+
+	LOG_INF("Starting Thread stack: PAN ID 0x%04x, channel %d, network \"%s\"",
+		CONFIG_OPENTHREAD_PANID, CONFIG_OPENTHREAD_CHANNEL,
+		CONFIG_OPENTHREAD_NETWORK_NAME);
+
+	(void)openthread_state_changed_callback_register(&thread_state_cb);
+
+	err = openthread_run();
+	if (err) {
+		LOG_ERR("Thread network join/attach attempt failed to start (err %d)", err);
+		return err;
+	}
+	LOG_INF("Thread network join/attach attempt started");
+
+	thread_udp_sock = zsock_socket(NET_AF_INET6, NET_SOCK_DGRAM, NET_IPPROTO_UDP);
+	if (thread_udp_sock < 0) {
+		LOG_ERR("Failed to create UDP socket (errno %d)", errno);
+		return -errno;
+	}
+
+	memset(&local_addr, 0, sizeof(local_addr));
+	local_addr.sin6_family = NET_AF_INET6;
+	local_addr.sin6_addr = net_in6addr_any;
+	local_addr.sin6_port = net_htons(THREAD_TELEMETRY_MCAST_PORT);
+
+	err = zsock_bind(thread_udp_sock, (struct net_sockaddr *)&local_addr, sizeof(local_addr));
+	if (err) {
+		LOG_ERR("Failed to bind UDP socket to port %d (errno %d)",
+			THREAD_TELEMETRY_MCAST_PORT, errno);
+		zsock_close(thread_udp_sock);
+		thread_udp_sock = -1;
+		return -errno;
+	}
+
+	err = thread_join_multicast_group(thread_udp_sock);
+	if (err) {
+		zsock_close(thread_udp_sock);
+		thread_udp_sock = -1;
+		return err;
+	}
+
+	LOG_INF("UDP telemetry listener ready on [%s]:%d", THREAD_TELEMETRY_MCAST_ADDR,
+		THREAD_TELEMETRY_MCAST_PORT);
+
+	return 0;
+}
+
+/* Released once by main() after the selected mode's stack is fully up, so
+ * the Thread receive thread never calls zsock_recvfrom() on a socket that
+ * doesn't exist yet. Mode 1 doesn't need this gate (all its work happens on
+ * Bluetooth host callbacks driven by bt_enable() itself), but the semaphore
+ * is unconditionally defined and given so the Mode 2 thread's wait is
+ * simple regardless of which mode ends up active.
+ */
+static K_SEM_DEFINE(stack_ready_sem, 0, 1);
+
+#define THREAD_RX_THREAD_STACK_SIZE 2048
+#define THREAD_RX_THREAD_PRIORITY 7 /* Preemptible; distinct from the OT work queue thread */
+
+/**
+ * Dedicated receive thread for Mode 2, started unconditionally at compile
+ * time (K_THREAD_DEFINE runs regardless of the persisted mode -- mirroring
+ * xenon_sensor's always-defined sampling thread) but blocked on
+ * stack_ready_sem until main() has confirmed Mode 2 is actually selected
+ * and its socket is up. In Mode 1 this thread parks forever on the
+ * semaphore, since main() only gives it after thread_mode_start()
+ * succeeds.
+ */
+static void thread_rx_thread_entry(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	uint8_t rx_buf[sizeof(struct telemetry_payload)];
+
+	k_sem_take(&stack_ready_sem, K_FOREVER);
+
+	if (current_mode != MODE_THREAD || thread_udp_sock < 0) {
+		/* Mode 1 is active (or Mode 2 bring-up failed) -- nothing for
+		 * this thread to do.
+		 */
+		return;
+	}
+
+	LOG_INF("Thread telemetry receive loop started");
+
+	while (1) {
+		ssize_t received = zsock_recvfrom(thread_udp_sock, rx_buf, sizeof(rx_buf), 0,
+						   NULL, NULL);
+
+		if (received < 0) {
+			LOG_WRN("recvfrom failed (errno %d)", errno);
+			continue;
+		}
+
+		telemetry_emit_json(rx_buf, (size_t)received, "Thread");
+	}
+}
+
+K_THREAD_DEFINE(thread_rx_tid, THREAD_RX_THREAD_STACK_SIZE, thread_rx_thread_entry,
+		 NULL, NULL, NULL, THREAD_RX_THREAD_PRIORITY, 0, 0);
+
+/* ===========================================================================
+ * 6. Entry point
+ * ===========================================================================
+ * main() resolves the mode (checking the MODE button first), then brings up
+ * exactly one radio stack. All recurring work happens on Bluetooth host
+ * callbacks (Mode 1) or the dedicated receive thread above (Mode 2) - main()
+ * itself has nothing left to do once it returns.
  */
 
 /* With a native USB-CDC console (see boards/particle_argon.overlay), early
  * printk()/LOG_INF output before a host has actually opened the serial port
  * can be silently dropped -- there's no DTR asserted yet. Wait for DTR with
- * a bounded timeout so the app still proceeds (BLE scanning is useful even
+ * a bounded timeout so the app still proceeds (both modes are useful even
  * with nobody watching the console) if nothing ever opens the port.
  */
 #define CONSOLE_DTR_WAIT_TIMEOUT_MS 3000
@@ -487,18 +944,66 @@ static void wait_for_console_dtr(void)
 
 int main(void)
 {
+	int err;
+	enum device_mode mode;
+
 	wait_for_console_dtr();
 
-	int err = bt_enable(NULL);
+	err = mode_storage_init();
+	if (err) {
+		/* Can't safely honor a MODE button press without durable
+		 * storage to persist it to (that would risk a reboot loop),
+		 * so just fall back to Mode 1 for this boot and skip the
+		 * button check entirely.
+		 */
+		LOG_ERR("Mode storage init failed (err %d); defaulting to Mode 1 (BLE) "
+			"for this boot only", err);
+		mode = MODE_BLE;
+	} else {
+		mode = mode_load();
+
+		if (mode_button_is_held()) {
+			enum device_mode next = (mode == MODE_BLE) ? MODE_THREAD : MODE_BLE;
+
+			LOG_INF("MODE button held at boot: switching %s -> %s",
+				mode_name(mode), mode_name(next));
+
+			err = mode_store(next);
+			if (err) {
+				LOG_ERR("Failed to persist new mode (err %d); staying in %s",
+					err, mode_name(mode));
+			} else {
+				LOG_INF("Rebooting to apply %s...", mode_name(next));
+				/* Give the log backend a moment to flush the
+				 * message above over the console UART before
+				 * the reset tears everything down.
+				 */
+				k_sleep(K_MSEC(50));
+				sys_reboot(SYS_REBOOT_COLD);
+				/* unreachable */
+			}
+		}
+	}
+
+	current_mode = mode;
+	LOG_INF("Booting in %s", mode_name(mode));
+
+	if (mode == MODE_BLE) {
+		err = ble_mode_start();
+	} else {
+		err = thread_mode_start();
+	}
 
 	if (err) {
-		LOG_ERR("Bluetooth init failed (err %d)", err);
+		LOG_ERR("Failed to start %s (err %d)", mode_name(mode), err);
 		return 0;
 	}
 
-	LOG_INF("Bluetooth initialized");
-
-	start_scan();
+	/* Let the Thread receive thread proceed now that the selected mode's
+	 * stack is up (a no-op wakeup in Mode 1, where the thread exits
+	 * immediately upon checking current_mode).
+	 */
+	k_sem_give(&stack_ready_sem);
 
 	return 0;
 }
