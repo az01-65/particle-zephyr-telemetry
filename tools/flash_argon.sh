@@ -10,6 +10,15 @@
 # This mass-erases the board before programming, which wipes whatever
 # firmware/bootloader is currently on it. That step requires explicit
 # confirmation (either pass --yes/-y, or confirm interactively when asked).
+#
+# Side effect, worth knowing: this also always resets the persisted BLE/
+# Thread mode selection (see src/main.c) back to its Mode 1 (BLE) default,
+# since mass-erase wipes the NVS storage partition along with everything
+# else. This is intentional, not a bug -- a partial (non-erasing) flash can
+# leave the persisted mode in an unpredictable state if NVS happened to be
+# mid-garbage-collection at the moment of reset, so a full erase is what
+# makes "freshly flashed = definitely Mode 1 (BLE)" a reliable guarantee
+# rather than a coin flip.
 
 set -euo pipefail
 
