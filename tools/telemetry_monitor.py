@@ -6,7 +6,11 @@ The Argon gateway firmware decodes BLE advertisements/notifications from a
 Xenon sensor node and prints one JSON object per line to its USB serial
 console, shaped like:
 
-    {"temp_c": 23.50, "vdd_mv": 3300, "seq": 12}
+    {"node_id": "0x4a", "temp_c": 23.50, "vdd_mv": 3300, "seq": 12}
+
+node_id identifies which physical Xenon a sample came from - every Xenon
+runs the identical firmware image, so this is derived from each board's own
+factory-programmed hardware ID rather than being baked in per-build.
 
 The same serial stream also carries Zephyr LOG_INF debug lines and other
 boot-time chatter, which are NOT valid JSON. This script reads the serial
@@ -47,8 +51,8 @@ def parse_args():
 
 
 def print_header():
-    print(f"{'TIME':<12} {'TEMP (C)':>10} {'VDD (mV)':>10} {'SEQ':>8}")
-    print("-" * 44)
+    print(f"{'TIME':<12} {'NODE':>6} {'TEMP (C)':>10} {'VDD (mV)':>10} {'SEQ':>8}")
+    print("-" * 51)
 
 
 def print_reading(reading):
@@ -56,19 +60,22 @@ def print_reading(reading):
 
     Unexpected/missing fields are tolerated by falling back to 'N/A' rather
     than crashing, since the exact schema is defined by firmware we don't
-    control here.
+    control here. node_id is absent on samples from older firmware without
+    per-board IDs, so it falls back the same way.
     """
     now = datetime.now().strftime("%H:%M:%S")
 
+    node_id = reading.get("node_id")
     temp_c = reading.get("temp_c")
     vdd_mv = reading.get("vdd_mv")
     seq = reading.get("seq")
 
+    node_str = str(node_id) if node_id is not None else "N/A"
     temp_str = f"{temp_c:.2f}" if isinstance(temp_c, (int, float)) else "N/A"
     vdd_str = str(vdd_mv) if vdd_mv is not None else "N/A"
     seq_str = str(seq) if seq is not None else "N/A"
 
-    print(f"{now:<12} {temp_str:>10} {vdd_str:>10} {seq_str:>8}")
+    print(f"{now:<12} {node_str:>6} {temp_str:>10} {vdd_str:>10} {seq_str:>8}")
 
 
 def main():

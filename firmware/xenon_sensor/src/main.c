@@ -56,6 +56,7 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/flash.h>
 #include <zephyr/drivers/uart.h>
+#include <zephyr/drivers/hwinfo.h>
 #include <zephyr/dt-bindings/adc/nrf-saadc.h>
 
 #include <zephyr/kvss/nvs.h>
@@ -80,7 +81,7 @@ LOG_MODULE_REGISTER(xenon_sensor, LOG_LEVEL_INF);
  * 1. Wire format - shared contract with argon_gateway (Mode 1) and with
  *    whatever eventually listens on the Thread multicast group (Mode 2)
  * ===========================================================================
- * Exactly 8 bytes, little-endian (native byte order on the Cortex-M4 in the
+ * Exactly 9 bytes, little-endian (native byte order on the Cortex-M4 in the
  * nRF52840, so no explicit byte-swapping is needed here). Do not reorder,
  * resize, or reinterpret these fields without updating consumers on both
  * sides.
@@ -89,10 +90,46 @@ struct __packed telemetry_payload {
 	int16_t temp_centi_c;	/* On-chip die temperature, in 0.01 degC steps (2350 = 23.50C) */
 	uint16_t vdd_mv;	/* Regulated rail voltage as seen by the SAADC, in millivolts */
 	uint32_t seq;		/* Monotonically incrementing sample counter */
+	uint8_t node_id;	/* Per-board identifier - see node_id_init() below */
 };
 
-BUILD_ASSERT(sizeof(struct telemetry_payload) == 8,
-	     "telemetry_payload must stay exactly 8 bytes on the wire");
+BUILD_ASSERT(sizeof(struct telemetry_payload) == 9,
+	     "telemetry_payload must stay exactly 9 bytes on the wire");
+
+/* Every physical board runs the identical xenon_sensor image - there is no
+ * per-board build, matching the project's "clone and flash, no setup" goal.
+ * That means node_id can't come from a compile-time constant; it has to be
+ * derived from something already unique per chip. hwinfo_get_device_id()
+ * reads the nRF52840's factory-programmed FICR DEVICEID, which is exactly
+ * that. The bytes are XOR-folded down to a single uint8_t: with only a
+ * handful of boards on one demo mesh, a full 1-in-256 collision space is
+ * more than enough to tell them apart on the gateway console, and folding to
+ * one byte keeps the wire format at 9 bytes instead of pulling in a much
+ * wider (and mostly redundant, for this purpose) identifier. Set once at
+ * boot in main(), before the sampling thread starts; never changes after.
+ */
+static uint8_t g_node_id;
+
+static void node_id_init(void)
+{
+	uint8_t buf[8] = {0};
+	ssize_t len = hwinfo_get_device_id(buf, sizeof(buf));
+
+	if (len < 0) {
+		LOG_WRN("hwinfo_get_device_id failed (err %d); node_id will read as 0", (int)len);
+		g_node_id = 0;
+		return;
+	}
+
+	uint8_t folded = 0;
+
+	for (ssize_t i = 0; i < len; i++) {
+		folded ^= buf[i];
+	}
+
+	g_node_id = folded;
+	LOG_INF("Node ID: 0x%02x (folded from %d-byte hardware device ID)", g_node_id, (int)len);
+}
 
 /* Sampling cadence. 5s keeps the demo responsive; a deployed sensor node
  * would likely stretch this to minutes to save even more power. Shared by
@@ -725,7 +762,7 @@ static int thread_mode_start(void)
 }
 
 /**
- * Send one telemetry sample as an 8-byte UDP multicast datagram. Mirrors
+ * Send one telemetry sample as a 9-byte UDP multicast datagram. Mirrors
  * the logging style of Mode 1's bt_gatt_notify() call site.
  */
 static void thread_send_telemetry(const struct telemetry_payload *payload)
@@ -745,8 +782,8 @@ static void thread_send_telemetry(const struct telemetry_payload *payload)
 		return;
 	}
 
-	LOG_INF("UDP multicast sent: seq=%u temp=%d vdd=%u -> [%s]:%d",
-		payload->seq, payload->temp_centi_c, payload->vdd_mv,
+	LOG_INF("UDP multicast sent: node=0x%02x seq=%u temp=%d vdd=%u -> [%s]:%d",
+		payload->node_id, payload->seq, payload->temp_centi_c, payload->vdd_mv,
 		THREAD_TELEMETRY_MCAST_ADDR, THREAD_TELEMETRY_MCAST_PORT);
 }
 
@@ -958,6 +995,7 @@ static void sampling_thread_entry(void *p1, void *p2, void *p3)
 		latest_telemetry.temp_centi_c = temp_centi_c;
 		latest_telemetry.vdd_mv = vdd_mv;
 		latest_telemetry.seq = seq;
+		latest_telemetry.node_id = g_node_id;
 		snapshot = latest_telemetry;
 		k_mutex_unlock(&telemetry_lock);
 
@@ -978,8 +1016,9 @@ static void sampling_thread_entry(void *p1, void *p2, void *p3)
 			if (err) {
 				LOG_WRN("Notify failed for sample #%u (err %d)", seq, err);
 			} else {
-				LOG_INF("Notified subscriber: seq=%u temp=%d vdd=%u",
-					snapshot.seq, snapshot.temp_centi_c, snapshot.vdd_mv);
+				LOG_INF("Notified subscriber: node=0x%02x seq=%u temp=%d vdd=%u",
+					snapshot.node_id, snapshot.seq, snapshot.temp_centi_c,
+					snapshot.vdd_mv);
 			}
 		} else {
 			thread_send_telemetry(&snapshot);
@@ -1045,6 +1084,7 @@ int main(void)
 	 */
 	(void)status_led_init();
 	mode_button_init();
+	node_id_init();
 
 	err = mode_storage_init();
 	if (err) {

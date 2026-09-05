@@ -98,10 +98,11 @@ struct __packed telemetry_payload {
 	int16_t temp_centi_c;  /* hundredths of a degree C */
 	uint16_t vdd_mv;        /* millivolts */
 	uint32_t seq;            /* monotonic sample counter */
+	uint8_t node_id;         /* per-board ID; see xenon_sensor's node_id_init() */
 };
 
-BUILD_ASSERT(sizeof(struct telemetry_payload) == 8,
-	     "telemetry_payload must match the 8-byte wire format on both links");
+BUILD_ASSERT(sizeof(struct telemetry_payload) == 9,
+	     "telemetry_payload must match the 9-byte wire format on both links");
 
 /* ===========================================================================
  * 2. Mode selection
@@ -262,11 +263,16 @@ static bool mode_button_read(void)
  */
 
 /**
- * Decode a raw 8-byte little-endian telemetry_payload buffer and print it
+ * Decode a raw 9-byte little-endian telemetry_payload buffer and print it
  * as a JSON line on the USB-CDC console, in the exact format
  * tools/telemetry_monitor.py already expects:
  *
- *   {"temp_c": 23.50, "vdd_mv": 3300, "seq": 12}
+ *   {"node_id": "0x4a", "temp_c": 23.50, "vdd_mv": 3300, "seq": 12}
+ *
+ * node_id is emitted as a hex string (not a bare number) since it's an
+ * opaque per-board fingerprint, not a quantity - printing it as "0x4a"
+ * rather than "74" keeps that distinction obvious to a human reading the
+ * stream.
  *
  * @param data   Pointer to at least sizeof(struct telemetry_payload) bytes.
  * @param length Length of the buffer at data, in bytes.
@@ -294,17 +300,18 @@ static void telemetry_emit_json(const void *data, size_t length, const char *sou
 	int16_t temp_centi_c = (int16_t)sys_le16_to_cpu((uint16_t)payload.temp_centi_c);
 	uint16_t vdd_mv = sys_le16_to_cpu(payload.vdd_mv);
 	uint32_t seq = sys_le32_to_cpu(payload.seq);
+	uint8_t node_id = payload.node_id;
 
 	float temp_c = (float)temp_centi_c / 100.0f;
 
 	/* JSON on USB serial for tools/telemetry_monitor.py -- identical
 	 * format regardless of which mode/link produced this sample.
 	 */
-	printk("{\"temp_c\": %.2f, \"vdd_mv\": %u, \"seq\": %u}\n",
-	       (double)temp_c, vdd_mv, seq);
+	printk("{\"node_id\": \"0x%02x\", \"temp_c\": %.2f, \"vdd_mv\": %u, \"seq\": %u}\n",
+	       node_id, (double)temp_c, vdd_mv, seq);
 
-	LOG_INF("Telemetry from %s: temp=%.2fC vdd=%umV seq=%u",
-		source, (double)temp_c, vdd_mv, seq);
+	LOG_INF("Telemetry from %s: node=0x%02x temp=%.2fC vdd=%umV seq=%u",
+		source, node_id, (double)temp_c, vdd_mv, seq);
 }
 
 /* ===========================================================================
