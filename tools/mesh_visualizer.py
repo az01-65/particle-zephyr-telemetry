@@ -80,33 +80,27 @@ def render(nodes, total_count, start_time, stale_after, port):
     lines.append(f"Uptime: {now - start_time:.0f}s   Total packets: {total_count}")
     lines.append("")
 
-    # --- Topology: Argon is the fixed hub. Every node_id ever seen becomes
-    # one spoke. This mirrors the real, structurally-enforced star shape of
-    # the mesh (see module docstring) - it is not an approximation drawn for
-    # convenience.
+    # --- Topology: Argon is the fixed root. Every node_id ever seen becomes
+    # one child, listed as an indented tree rather than drawn as a fixed-
+    # width diagram - this mirrors the real, structurally-enforced star
+    # shape of the mesh (see module docstring), and scales cleanly to any
+    # number of nodes without alignment math.
     lines.append(f"{BOLD}Topology{RESET}")
     lines.append("")
-    lines.append("               +----------------+")
-    lines.append("               |  Argon Gateway |")
-    lines.append("               +----------------+")
+    lines.append("Argon Gateway (Leader)")
 
     node_ids = sorted(nodes.keys())
     if not node_ids:
-        lines.append("                      |")
-        lines.append(f"               {DIM}(no samples yet - waiting){RESET}")
+        lines.append(f"{DIM}   (no samples yet - waiting){RESET}")
     else:
-        lines.append("                      |")
-        branch = "        " + "-" * (14 * len(node_ids))
-        lines.append(branch if len(node_ids) > 1 else "                      |")
-        row = ""
-        for node_id in node_ids:
+        for i, node_id in enumerate(node_ids):
             info = nodes[node_id]
             age = now - info["last_seen"]
             live = age <= stale_after
+            connector = "└─" if i == len(node_ids) - 1 else "├─"
             color = GREEN if live else DIM
-            label = f"{color}[{node_id}]{RESET}"
-            row += f"      {label}"
-        lines.append(row)
+            status = "LIVE " if live else "STALE"
+            lines.append(f"{connector} {color}Xenon {node_id:<6} {status}  {fmt_age(age)}{RESET}")
 
     lines.append("")
 
