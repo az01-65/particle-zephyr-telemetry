@@ -82,6 +82,8 @@
 #include <zephyr/net/socket.h>
 #include <openthread/thread.h>
 #include <openthread/instance.h>
+#include <openthread/ip6.h>
+#include <openthread/link.h>
 
 #include <zephyr/logging/log.h>
 
@@ -262,6 +264,21 @@ static bool mode_button_read(void)
  * little-endian struct telemetry_payload, so one decoder covers both.
  */
 
+/* Diagnostic only, not used by application logic: mirrors the most recently
+ * decoded sample plus a running receive count, directly readable over SWD -
+ * same rationale as g_thread_partition_id further below. The USB-CDC
+ * console has a known, already-documented quirk where LOG_INF/printk output
+ * can sit unflushed rather than actually reaching the host, which makes it
+ * an unreliable way to confirm "did a sample actually arrive and decode
+ * correctly" during bring-up; these globals give a ground-truth answer
+ * independent of that.
+ */
+volatile uint32_t g_rx_count;
+volatile uint8_t g_last_node_id;
+volatile int16_t g_last_temp_centi_c;
+volatile uint16_t g_last_vdd_mv;
+volatile uint32_t g_last_seq;
+
 /**
  * Decode a raw 9-byte little-endian telemetry_payload buffer and print it
  * as a JSON line on the USB-CDC console, in the exact format
@@ -303,6 +320,12 @@ static void telemetry_emit_json(const void *data, size_t length, const char *sou
 	uint8_t node_id = payload.node_id;
 
 	float temp_c = (float)temp_centi_c / 100.0f;
+
+	g_last_node_id = node_id;
+	g_last_temp_centi_c = temp_centi_c;
+	g_last_vdd_mv = vdd_mv;
+	g_last_seq = seq;
+	g_rx_count++;
 
 	/* JSON on USB serial for tools/telemetry_monitor.py -- identical
 	 * format regardless of which mode/link produced this sample.
@@ -734,6 +757,39 @@ static bool thread_attached;
  */
 volatile uint32_t g_thread_partition_id;
 
+/* Set true the first time the multicast group join actually succeeds.
+ * Written only by thread_rx_thread_entry() (see section 5's wait loop
+ * there) - deliberately NOT from this callback. thread_state_changed() runs
+ * in OpenThread's own callback context, and an earlier version of this fix
+ * called the blocking zsock_setsockopt() from directly inside it, which
+ * kernel-panicked (K_ERR_KERNEL_PANIC, confirmed via SWD: halted in
+ * arch_system_halt, reached through an SVC-triggered fault) shortly after
+ * attach - almost certainly because that context isn't a safe place to make
+ * a blocking socket call (wrong stack/priority/lock assumptions for it).
+ * The rx thread's own context, which already exists specifically to make
+ * blocking socket calls, is the safe place for this instead.
+ */
+volatile bool multicast_group_joined;
+
+/* Diagnostic only: see the otIp6GetMulticastAddresses() check in
+ * thread_rx_thread_entry() (section 5) for what these actually verify.
+ */
+volatile uint32_t g_ot_mcast_count;
+volatile bool g_ot_mcast_target_found;
+
+/* Diagnostic only: OpenThread's own built-in MAC/IP packet counters,
+ * refreshed periodically by the status LED thread (see its loop below) so
+ * they're readable over SWD without needing a dedicated poll point. Used to
+ * bisect "does any frame ever arrive at this node's radio/MAC layer at all"
+ * (mMacRxTotal) from "does OpenThread's own IP layer count it as a
+ * successfully received IPv6 packet" (g_ip_rx_success/g_ip_rx_failure) -
+ * both upstream of, and independent from, whether it ever reaches our
+ * specific application socket (g_rx_count above).
+ */
+volatile uint32_t g_mac_rx_total;
+volatile uint32_t g_ip_rx_success;
+volatile uint32_t g_ip_rx_failure;
+
 static void thread_state_changed(otChangedFlags flags, void *context)
 {
 	ARG_UNUSED(context);
@@ -805,13 +861,35 @@ static struct openthread_state_changed_callback thread_state_cb = {
  *     listens for that exact event and calls
  *     otIp6SubscribeMulticastAddress() in response (add_ipv6_maddr_to_ot()),
  *     which is what actually tells the OpenThread mesh stack to accept and
- *     forward this realm-local multicast group to us. (The OpenThread
- *     interface also sets NET_IF_IPV6_NO_MLD, so net_ipv6_mld_join() skips
- *     sending an actual MLDv2 report over the air -- correct, since Thread
- *     uses its own multicast subscription mechanism, not link-local MLD.)
+ *     forward this realm-local multicast group to us. This step ALSO needed
+ *     CONFIG_NET_MGMT_EVENT/CONFIG_NET_MGMT_EVENT_INFO (see prj.conf) -
+ *     without them the #ifdef block containing this handler doesn't even
+ *     compile in, so the event fires into nothing.
  *   - Kconfig.ipv6 NET_IPV6_MLD: defaults to y, but made explicit in
  *     prj.conf since net_ipv6_mld_join() is a stub returning -ENOTSUP when
  *     it's off (see include/zephyr/net/mld.h).
+ *
+ * A second, separate gap exists past all of the above, root-caused via SWD
+ * by directly inspecting the live struct net_if_ipv6 (real GDB struct
+ * printing against the correct ELF, not guessed offsets): the OpenThread
+ * interface sets NET_IF_IPV6_NO_MLD (correctly - Thread has its own
+ * multicast mechanism, not link-local MLD), but subsys/net/ip/ipv6_mld.c's
+ * net_ipv6_mld_join() has an early `if (net_if_flag_is_set(iface,
+ * NET_IF_IPV6_NO_MLD)) { return 0; }` that skips over the *only* code path
+ * (the `out:` label, reached otherwise only for offloaded interfaces or
+ * after actually sending an MLDv2 report) that calls
+ * net_if_ipv6_maddr_join() - the call that marks a multicast address
+ * "is_joined", as opposed to merely "is_used". Confirmed on real hardware:
+ * our target address was genuinely present in the interface's mcast[] array
+ * (is_used=1) and in OpenThread's own otIp6GetMulticastAddresses() table,
+ * with OpenThread's own IP layer counters (otThreadGetIp6Counters())
+ * showing real, matching-in-number successful packet receptions - yet
+ * is_joined stayed permanently 0, and Zephyr's own IPv6-to-socket delivery
+ * path apparently gates on is_joined specifically, not is_used, so nothing
+ * ever reached this application's socket. thread_join_multicast_group()
+ * below finishes the join Zephyr's own call left incomplete, by looking up
+ * the same net_if_mcast_addr entry and calling net_if_ipv6_maddr_join() on
+ * it directly.
  */
 static int thread_join_multicast_group(int sock)
 {
@@ -835,6 +913,30 @@ static int thread_join_multicast_group(int sock)
 		return -errno;
 	}
 
+	/* Finish what net_ipv6_mld_join() left incomplete on a
+	 * NET_IF_IPV6_NO_MLD interface - see this function's header comment
+	 * for the full root-cause writeup. Without this, the address sits at
+	 * is_used=1/is_joined=0 forever and no traffic addressed to it ever
+	 * reaches this socket, despite every other layer (OpenThread's own
+	 * subscription table, the socket call's own success return) looking
+	 * correct.
+	 */
+	{
+		struct net_if *maddr_iface = net_if_get_default();
+		struct net_if_mcast_addr *maddr =
+			net_if_ipv6_maddr_lookup(&mreq.ipv6mr_multiaddr, &maddr_iface);
+
+		if (maddr == NULL) {
+			LOG_ERR("Multicast address added but not found on lookup - "
+				"cannot complete join");
+			return -ENOENT;
+		}
+
+		if (!net_if_ipv6_maddr_is_joined(maddr)) {
+			net_if_ipv6_maddr_join(maddr_iface, maddr);
+		}
+	}
+
 	LOG_INF("Joined multicast group [%s]:%d", THREAD_TELEMETRY_MCAST_ADDR,
 		THREAD_TELEMETRY_MCAST_PORT);
 
@@ -844,12 +946,17 @@ static int thread_join_multicast_group(int sock)
 /**
  * Bring up Mode 2: register role-change logging, join the Thread network
  * (this is the one and only place openthread_run() is called anywhere in
- * this file), open a UDP socket bound to the telemetry port, and join the
- * telemetry multicast group on it. Only ever called from main() when
- * current_mode == MODE_THREAD. The actual receive loop runs on the
- * dedicated thread in this same section, started unconditionally by
- * K_THREAD_DEFINE() below but gated on stack_ready_sem the same way
- * xenon_sensor gates its sampling thread.
+ * this file), and open a UDP socket bound to the telemetry port. Only ever
+ * called from main() when current_mode == MODE_THREAD. The actual receive
+ * loop runs on the dedicated thread in this same section, started
+ * unconditionally by K_THREAD_DEFINE() below but gated on stack_ready_sem
+ * the same way xenon_sensor gates its sampling thread.
+ *
+ * Deliberately does NOT join the telemetry multicast group here - only
+ * openthread_run()'s asynchronous join/attach attempt is started at this
+ * point, not completed, so this node isn't actually part of the mesh yet.
+ * See thread_state_changed()'s multicast_group_joined handling above for
+ * where (and why) that join actually happens.
  */
 static int thread_mode_start(void)
 {
@@ -860,15 +967,13 @@ static int thread_mode_start(void)
 		CONFIG_OPENTHREAD_PANID, CONFIG_OPENTHREAD_CHANNEL,
 		CONFIG_OPENTHREAD_NETWORK_NAME);
 
-	(void)openthread_state_changed_callback_register(&thread_state_cb);
-
-	err = openthread_run();
-	if (err) {
-		LOG_ERR("Thread network join/attach attempt failed to start (err %d)", err);
-		return err;
-	}
-	LOG_INF("Thread network join/attach attempt started");
-
+	/* Socket created and bound BEFORE openthread_run() starts the
+	 * (asynchronous) join/attach attempt - not just for tidiness. The
+	 * role-changed callback that triggers the deferred multicast join
+	 * checks thread_udp_sock >= 0 before acting; creating the socket
+	 * first closes off any window, however unlikely in practice, where
+	 * attach could complete before this socket exists.
+	 */
 	thread_udp_sock = zsock_socket(NET_AF_INET6, NET_SOCK_DGRAM, NET_IPPROTO_UDP);
 	if (thread_udp_sock < 0) {
 		LOG_ERR("Failed to create UDP socket (errno %d)", errno);
@@ -889,15 +994,17 @@ static int thread_mode_start(void)
 		return -errno;
 	}
 
-	err = thread_join_multicast_group(thread_udp_sock);
+	LOG_INF("UDP socket bound on port %d; multicast group join deferred until attached",
+		THREAD_TELEMETRY_MCAST_PORT);
+
+	(void)openthread_state_changed_callback_register(&thread_state_cb);
+
+	err = openthread_run();
 	if (err) {
-		zsock_close(thread_udp_sock);
-		thread_udp_sock = -1;
+		LOG_ERR("Thread network join/attach attempt failed to start (err %d)", err);
 		return err;
 	}
-
-	LOG_INF("UDP telemetry listener ready on [%s]:%d", THREAD_TELEMETRY_MCAST_ADDR,
-		THREAD_TELEMETRY_MCAST_PORT);
+	LOG_INF("Thread network join/attach attempt started");
 
 	return 0;
 }
@@ -938,6 +1045,70 @@ static void thread_rx_thread_entry(void *p1, void *p2, void *p3)
 		 * this thread to do.
 		 */
 		return;
+	}
+
+	/* Wait for actual attachment before joining the telemetry multicast
+	 * group - not just for tidiness. openthread_run() (called back in
+	 * thread_mode_start()) only *starts* the join/attach attempt
+	 * asynchronously; joining the multicast group before this node is
+	 * actually part of the mesh was root-caused as the reason telemetry
+	 * never arrived here at all despite the sender's own zsock_sendto()
+	 * succeeding and both nodes confirmed on the same Thread partition.
+	 * The socket-level ZSOCK_IPV6_ADD_MEMBERSHIP call still reports
+	 * success either way (it only registers the address with this
+	 * interface's own local list), but the deeper step that actually
+	 * tells the Thread mesh to forward this group's traffic to us needs
+	 * the node to already be attached. Polling thread_attached from this
+	 * thread's own context - rather than calling the join straight out
+	 * of thread_state_changed()'s OpenThread callback context, which
+	 * kernel-panicked when tried - is what makes this both correct and
+	 * safe; see multicast_group_joined's comment in section 2 for why.
+	 */
+	while (!thread_attached) {
+		k_sleep(K_MSEC(200));
+	}
+
+	int join_err = thread_join_multicast_group(thread_udp_sock);
+
+	if (join_err) {
+		LOG_ERR("Multicast group join failed post-attach (err %d)", join_err);
+	} else {
+		multicast_group_joined = true;
+	}
+
+	/* Diagnostic only: the ZSOCK_IPV6_ADD_MEMBERSHIP call above reports
+	 * success as soon as Zephyr's own net_if-level IPv6 multicast address
+	 * list accepts the address (see thread_join_multicast_group()'s
+	 * comment) - that's a DIFFERENT list from the one OpenThread's own
+	 * C++ core actually consults when deciding whether to accept/forward
+	 * mesh traffic for this group. Read that second, authoritative list
+	 * directly via otIp6GetMulticastAddresses() and mirror whether our
+	 * target group is actually present in it, so a gap between "Zephyr
+	 * thinks it worked" and "OpenThread's own mesh logic knows about it"
+	 * is visible over SWD instead of just inferred from zero deliveries.
+	 */
+	{
+		static const uint8_t target_addr[16] = {
+			0xff, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xab, 0xcd,
+		};
+		otInstance *ot = openthread_get_default_instance();
+		const otNetifMulticastAddress *addr = otIp6GetMulticastAddresses(ot);
+		uint32_t count = 0;
+		bool found = false;
+
+		while (addr) {
+			count++;
+			if (memcmp(addr->mAddress.mFields.m8, target_addr, 16) == 0) {
+				found = true;
+			}
+			addr = addr->mNext;
+		}
+
+		g_ot_mcast_count = count;
+		g_ot_mcast_target_found = found;
+		LOG_INF("OpenThread multicast table: %u addresses, target group %s",
+			count, found ? "present" : "MISSING");
 	}
 
 	LOG_INF("Thread telemetry receive loop started");
@@ -1104,6 +1275,23 @@ static void status_led_thread_entry(void *p1, void *p2, void *p3)
 		} else {
 			blink_phase = !blink_phase;
 			gpio_pin_set_dt(led, blink_phase);
+		}
+
+		/* Diagnostic counter refresh - see g_mac_rx_total's comment in
+		 * section 2 for what this is for. Piggybacked on this
+		 * already-periodic thread rather than adding a dedicated one
+		 * just for this.
+		 */
+		if (current_mode == MODE_THREAD) {
+			openthread_mutex_lock();
+			otInstance *ot = openthread_get_default_instance();
+			const otMacCounters *mac_counters = otLinkGetCounters(ot);
+			const otIpCounters *ip_counters = otThreadGetIp6Counters(ot);
+
+			g_mac_rx_total = mac_counters->mRxTotal;
+			g_ip_rx_success = ip_counters->mRxSuccess;
+			g_ip_rx_failure = ip_counters->mRxFailure;
+			openthread_mutex_unlock();
 		}
 
 		k_sleep(K_MSEC(STATUS_LED_POLL_MS));

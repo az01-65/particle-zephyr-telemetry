@@ -670,6 +670,18 @@ static bool thread_attached;
  */
 volatile uint32_t g_thread_partition_id;
 
+/* Diagnostic only, not used by application logic: mirrors the outcome of
+ * every zsock_sendto() call in thread_send_telemetry(), directly readable
+ * over SWD. seq advancing only proves the sampling loop is alive - it says
+ * nothing about whether the network call underneath actually succeeded.
+ * These give a ground-truth answer to that specific question, independent
+ * of the console's known visibility quirks.
+ */
+volatile uint32_t g_send_attempt_count;
+volatile uint32_t g_send_success_count;
+volatile int32_t g_last_send_result; /* zsock_sendto()'s return value (bytes sent, or -1) */
+volatile int32_t g_last_send_errno;  /* errno at the time of the last failed send */
+
 static void thread_state_changed(otChangedFlags flags, void *context)
 {
 	ARG_UNUSED(context);
@@ -773,14 +785,21 @@ static void thread_send_telemetry(const struct telemetry_payload *payload)
 		return;
 	}
 
+	g_send_attempt_count++;
+
 	sent = zsock_sendto(thread_udp_sock, payload, sizeof(*payload), 0,
 			     (struct net_sockaddr *)&thread_telemetry_dst,
 			     sizeof(thread_telemetry_dst));
+	g_last_send_result = (int32_t)sent;
+
 	if (sent < 0) {
+		g_last_send_errno = (int32_t)errno;
 		LOG_WRN("UDP multicast send failed for sample #%u (errno %d)",
 			payload->seq, errno);
 		return;
 	}
+
+	g_send_success_count++;
 
 	LOG_INF("UDP multicast sent: node=0x%02x seq=%u temp=%d vdd=%u -> [%s]:%d",
 		payload->node_id, payload->seq, payload->temp_centi_c, payload->vdd_mv,
