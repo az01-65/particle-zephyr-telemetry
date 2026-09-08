@@ -7,6 +7,7 @@
 #
 #   ./tools/flash.sh argon --yes
 #   ./tools/flash.sh xenon --yes
+#   ./tools/flash.sh esp32 --yes  # esp32_passthrough - see that script's header
 #   ./tools/flash.sh              # no board named -> asks interactively
 #
 # Anything after the board name (e.g. --yes/-y) is passed straight through
@@ -18,14 +19,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-    echo "Usage: $0 [argon|xenon] [--yes|-y]" >&2
+    echo "Usage: $0 [argon|xenon|esp32] [--yes|-y]" >&2
     echo "  With no board named, asks interactively which one is on the debug probe." >&2
 }
 
 TARGET=""
 if [ $# -gt 0 ]; then
     case "$1" in
-        argon|xenon)
+        argon|xenon|esp32)
             TARGET="$1"
             shift
             ;;
@@ -47,12 +48,15 @@ fi
 
 if [ -z "$TARGET" ]; then
     echo "Which board is currently on the debug probe (SWD ribbon)?"
-    echo "  1) Argon"
-    echo "  2) Xenon"
-    read -r -p "Enter 1 or 2: " choice
+    echo "  1) Argon (mesh gateway firmware)"
+    echo "  2) Xenon (mesh sensor firmware)"
+    echo "  3) Argon (ESP32 passthrough - turns its USB port into a direct"
+    echo "     bridge to its onboard ESP32, for Arduino IDE/esptool.py)"
+    read -r -p "Enter 1, 2, or 3: " choice
     case "$choice" in
         1) TARGET="argon" ;;
         2) TARGET="xenon" ;;
+        3) TARGET="esp32" ;;
         *)
             echo "Aborted: not a valid choice." >&2
             exit 1
@@ -63,4 +67,5 @@ fi
 case "$TARGET" in
     argon) exec "${SCRIPT_DIR}/flash_argon.sh" "$@" ;;
     xenon) exec "${SCRIPT_DIR}/flash_xenon.sh" "$@" ;;
+    esp32) exec "${SCRIPT_DIR}/flash_esp32_passthrough.sh" "$@" ;;
 esac

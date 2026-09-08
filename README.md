@@ -8,6 +8,44 @@ new firmware stack.
 Clone it, flash it, and it just works — no Zephyr toolchain required to run
 it, only to rebuild it from source.
 
+## Fastest thing to try: use the Argon's ESP32 with Arduino IDE
+
+The Argon has a second chip most people never touch: an onboard ESP32
+Wi-Fi co-processor, normally locked to Particle's own AT-command firmware.
+This repo includes a standalone firmware image,
+[`firmware/esp32_passthrough`](firmware/esp32_passthrough), that turns the
+Argon's existing USB port into a direct, transparent bridge to that ESP32 —
+once it's flashed, Arduino IDE or `esptool.py` can flash and use the ESP32
+exactly like any normal, directly-USB-attached ESP32 dev board. No wiring,
+no separate USB-serial adapter, no manual boot-button presses.
+
+```bash
+brew install openocd                          # or your OS's package manager
+./tools/flash.sh esp32 --yes                  # with the Argon on the debug probe
+
+# Then just point Arduino IDE (ESP32 board package) or esptool.py at
+# whatever port the Argon enumerates as, same as any other ESP32 board:
+pip install esptool
+esptool.py --port /dev/cu.usbmodemXXXX chip_id
+```
+
+This is a separate, standalone firmware image — it has nothing to do with
+the mesh project below, and flashing it replaces whatever else is on the
+Argon's nRF52840 (the mesh gateway, if that's what's there). Flash
+`./tools/flash.sh argon --yes` to put the mesh gateway firmware back.
+
+How it actually works: the ESP32 has no USB of its own, only a UART link to
+the nRF52840 plus two GPIO control lines. This firmware bridges the raw
+UART traffic (via Zephyr's own in-tree `zephyr,uart-bridge` driver) and
+translates the host's DTR/RTS serial control signals into the ESP32's
+GPIO0/EN pins, using the exact mapping a normal ESP32 dev board's
+USB-serial chip uses — which is what lets an unmodified `esptool.py`/Arduino
+IDE upload flow reset the chip into its bootloader automatically. Verified
+on real hardware: `esptool.py chip_id` over this bridge correctly detects
+the real onboard ESP32-D0WD and reads back its real MAC address. See
+[`firmware/esp32_passthrough/src/main.c`](firmware/esp32_passthrough/src/main.c)
+for the full mechanism and exactly where the GPIO pin numbers come from.
+
 ## What this actually demonstrates
 
 - A real-time-OS firmware architecture with two independent, runtime-switchable
@@ -27,7 +65,7 @@ it, only to rebuild it from source.
 
 | Board | Role | Radio capability |
 |---|---|---|
-| Particle Argon | Gateway | nRF52840 (BLE + 802.15.4) + ESP32 Wi-Fi co-processor (unused here) |
+| Particle Argon | Gateway | nRF52840 (BLE + 802.15.4) + ESP32 Wi-Fi co-processor (unused by the mesh firmware — see `firmware/esp32_passthrough` above to use it directly) |
 | Particle Xenon ×2 | Sensor nodes | nRF52840 (BLE + 802.15.4) |
 
 Both are Adafruit Feather-form-factor nRF52840 boards. See
@@ -164,8 +202,8 @@ rather than working around one instance of it.
 
 | Tool | What it's for |
 |---|---|
-| `tools/flash.sh` | One entry point for flashing whichever board is on the probe (`./tools/flash.sh argon\|xenon --yes`). Thin wrapper — the per-board scripts below still work standalone. |
-| `tools/flash_argon.sh` / `tools/flash_xenon.sh` | Mass-erase + program from `prebuilt/*.hex` via OpenOCD. No west/Zephyr SDK needed. |
+| `tools/flash.sh` | One entry point for flashing whichever board/image is on the probe (`./tools/flash.sh argon\|xenon\|esp32 --yes`). Thin wrapper — the per-image scripts below still work standalone. |
+| `tools/flash_argon.sh` / `tools/flash_xenon.sh` / `tools/flash_esp32_passthrough.sh` | Mass-erase + program from `prebuilt/*.hex` via OpenOCD. No west/Zephyr SDK needed. |
 | `tools/telemetry_monitor.py` | Scrolling log of decoded JSON telemetry lines. |
 | `tools/mesh_visualizer.py` | Live redrawing dashboard — mesh topology tree + per-node table, LIVE/STALE inferred from packet timing. Works identically for BLE or Thread telemetry. |
 
@@ -239,8 +277,9 @@ fix site in the source, not duplicated here.
 
 ```
 firmware/
-  argon_gateway/   Gateway firmware (BLE central / Thread FTD)
-  xenon_sensor/     Sensor node firmware (BLE peripheral / Thread MTD)
+  argon_gateway/      Gateway firmware (BLE central / Thread FTD)
+  xenon_sensor/       Sensor node firmware (BLE peripheral / Thread MTD)
+  esp32_passthrough/  Standalone: USB<->UART bridge to the Argon's own ESP32
 prebuilt/            Ready-to-flash .hex files, regenerated per commit
 tools/                Flashing scripts + host-side Python utilities
 docs/
