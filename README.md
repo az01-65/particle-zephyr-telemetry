@@ -46,6 +46,51 @@ the real onboard ESP32-D0WD and reads back its real MAC address. See
 [`firmware/esp32_passthrough/src/main.c`](firmware/esp32_passthrough/src/main.c)
 for the full mechanism and exactly where the GPIO pin numbers come from.
 
+### Also possible: turn the Xenon itself into a standalone Arduino board
+
+Separately from the ESP32 passthrough above, a Xenon's *own* nRF52840 can
+become a real, directly-selectable Arduino board — no bridging needed,
+since (unlike the ESP32) it already has native USB. This uses Adafruit's
+official, MIT-licensed nRF52 bootloader and Arduino core, which has
+first-party "Particle Xenon" support built in.
+
+```bash
+./tools/flash.sh xenon-arduino --yes    # with a Xenon on the debug probe
+```
+
+Then in Arduino IDE: add `https://adafruit.github.io/arduino-board-index/package_adafruit_index.json`
+under Settings → Additional boards manager URLs, install "Adafruit nRF52"
+from Boards Manager, and select **Particle Xenon** as the board. From
+there it's a normal Arduino board — same USB cable, no separate adapter.
+
+**Two real caveats, both verified on real hardware, worth knowing before you start:**
+
+- **`LED_BUILTIN` doesn't visibly work** — a known, Adafruit-acknowledged
+  "wontfix" bug specific to this board (confirmed: the pin genuinely
+  toggles correctly, checked by reading the raw GPIO register live over
+  SWD mid-blink, it just doesn't light anything visible, most likely
+  because that particular LED isn't populated on this board revision).
+  Use the onboard RGB LED instead — Arduino pins **22 / 23 / 24** (red /
+  green / blue), the same physical LED this project's own Zephyr firmware
+  already drives successfully.
+- **Arduino IDE's Upload button is intermittently broken** — a
+  long-standing upstream bug in Adafruit's DFU-over-serial tool on macOS
+  with native-USB nRF52840 boards (multiple multi-year-old GitHub issues,
+  not anything specific to this repo). It can succeed once and then fail
+  on the very next attempt with the port simply vanishing. If it happens:
+  retry, or manually double-tap RESET right before clicking Upload. The
+  reliable fallback that always works: compile in Arduino IDE (Verify, not
+  Upload), then `./tools/flash.sh sketch --yes` — it finds your most
+  recently compiled sketch and flashes it directly over SWD, bypassing the
+  broken tool entirely.
+
+The Argon's own nRF52840 doesn't have this path yet — Adafruit's Arduino
+core has never included a "Particle Argon" board definition (confirmed
+directly against their `boards.txt`), so there's no board to select even
+though a working bootloader can be flashed (`./tools/flash.sh argon-arduino`).
+Closing that gap means writing a custom Arduino board variant, which
+doesn't exist in this project yet.
+
 ## What this actually demonstrates
 
 - A real-time-OS firmware architecture with two independent, runtime-switchable
@@ -202,8 +247,10 @@ rather than working around one instance of it.
 
 | Tool | What it's for |
 |---|---|
-| `tools/flash.sh` | One entry point for flashing whichever board/image is on the probe (`./tools/flash.sh argon\|xenon\|esp32 --yes`). Thin wrapper — the per-image scripts below still work standalone. |
-| `tools/flash_argon.sh` / `tools/flash_xenon.sh` / `tools/flash_esp32_passthrough.sh` | Mass-erase + program from `prebuilt/*.hex` via OpenOCD. No west/Zephyr SDK needed. |
+| `tools/flash.sh` | One entry point for flashing whichever board/image is on the probe (`./tools/flash.sh argon\|xenon\|esp32\|xenon-arduino\|argon-arduino\|sketch --yes`). Thin wrapper — the per-image scripts below still work standalone. |
+| `tools/flash_argon.sh` / `tools/flash_xenon.sh` / `tools/flash_esp32_passthrough.sh` | Mass-erase + program this repo's own mesh/passthrough firmware from `prebuilt/*.hex` via OpenOCD. No west/Zephyr SDK needed. |
+| `tools/flash_arduino_bootloader.sh` | Mass-erase + program Adafruit's official Arduino bootloader (`argon\|xenon`) — see the caveats above and this script's own header comment. |
+| `tools/flash_arduino_sketch.sh` | Flash an already-compiled Arduino sketch straight over SWD — the reliable fallback for Arduino IDE's own flaky Upload button. Auto-detects the most recently compiled sketch by default. |
 | `tools/telemetry_monitor.py` | Scrolling log of decoded JSON telemetry lines. |
 | `tools/mesh_visualizer.py` | Live redrawing dashboard — mesh topology tree + per-node table, LIVE/STALE inferred from packet timing. Works identically for BLE or Thread telemetry. |
 
@@ -240,6 +287,17 @@ the full reasoning.
 - No automated test suite — every check in this project's history was a
   real, physically-verified hardware test (SWD reads, live serial capture),
   not a simulation or unit test harness.
+- Arduino IDE's own Upload button, for a Xenon running Adafruit's
+  bootloader, is intermittently broken by a known upstream bug (see
+  "Also possible" above) — genuinely flaky, not something this repo can
+  fully fix, though a guaranteed-reliable fallback (`flash_arduino_sketch.sh`)
+  is provided.
+- `LED_BUILTIN` doesn't visibly work on a Xenon running Adafruit's
+  bootloader — a separate, Adafruit-acknowledged "wontfix" bug, not this
+  repo's Zephyr firmware (which drives the RGB LED correctly).
+- The Argon has no equivalent standalone-Arduino path for its own chip —
+  Adafruit's Arduino core has never included a "Particle Argon" board
+  definition. Only the Xenon has this capability today.
 
 ## Notable bugs found along the way
 
@@ -272,6 +330,16 @@ fix site in the source, not duplicated here.
    net_if_ipv6` memory over SWD, byte by byte, against the real ELF's
    struct layout. Worked around by finishing the join Zephyr's own call
    left incomplete.
+5. **Arduino bootloader/tooling version mismatch** — flashing Adafruit's
+   *standalone GitHub release* bootloader onto a Xenon made every Arduino
+   IDE upload fail, port vanishing mid-transfer, even though the bootloader
+   itself worked fine on its own (correct USB enumeration, mounted its UF2
+   drive correctly). Root cause: the *Arduino Boards Manager package*
+   bundles its own, different bootloader version (v0.9.1) paired with its
+   own upload tool — using the mismatched standalone release (v0.11.0)
+   broke the DFU handshake between the two. Fixed by vendoring the
+   bootloader from *inside* the installed Arduino package instead of
+   Adafruit's separate GitHub releases.
 
 ## Repo layout
 
