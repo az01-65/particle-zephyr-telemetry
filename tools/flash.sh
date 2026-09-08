@@ -22,14 +22,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-    echo "Usage: $0 [argon|xenon|esp32|xenon-arduino|argon-arduino|sketch] [--yes|-y]" >&2
+    echo "Usage: $0 [argon|xenon|esp32|xenon-arduino|argon-arduino|sketch|uf2] [--yes|-y]" >&2
+    echo "  ./tools/flash.sh uf2 <path/to/firmware.hex> --yes" >&2
     echo "  With no target named, asks interactively which one is on the debug probe." >&2
 }
 
 TARGET=""
 if [ $# -gt 0 ]; then
     case "$1" in
-        argon|xenon|esp32|argon-arduino|xenon-arduino|sketch)
+        argon|xenon|esp32|argon-arduino|xenon-arduino|sketch|uf2)
             TARGET="$1"
             shift
             ;;
@@ -61,7 +62,9 @@ if [ -z "$TARGET" ]; then
     echo "     IDE has no board definition for it yet, see the script header)"
     echo "  6) Flash an already-compiled Arduino sketch over SWD (reliable"
     echo "     fallback for Arduino IDE's own flaky Upload button)"
-    read -r -p "Enter 1-6: " choice
+    echo "  7) Flash a .hex file via UF2 drag-and-drop (no debug probe needed,"
+    echo "     board must already have the Adafruit bootloader and be in UF2 mode)"
+    read -r -p "Enter 1-7: " choice
     case "$choice" in
         1) TARGET="argon" ;;
         2) TARGET="xenon" ;;
@@ -69,6 +72,11 @@ if [ -z "$TARGET" ]; then
         4) TARGET="xenon-arduino" ;;
         5) TARGET="argon-arduino" ;;
         6) TARGET="sketch" ;;
+        7)
+            TARGET="uf2"
+            read -r -p "Path to .hex file: " UF2_HEX_PATH
+            set -- "$UF2_HEX_PATH" "$@"
+            ;;
         *)
             echo "Aborted: not a valid choice." >&2
             exit 1
@@ -83,4 +91,5 @@ case "$TARGET" in
     argon-arduino) exec "${SCRIPT_DIR}/flash_arduino_bootloader.sh" argon "$@" ;;
     xenon-arduino) exec "${SCRIPT_DIR}/flash_arduino_bootloader.sh" xenon "$@" ;;
     sketch) exec "${SCRIPT_DIR}/flash_arduino_sketch.sh" "$@" ;;
+    uf2) exec "${SCRIPT_DIR}/flash_uf2.sh" "$@" ;;
 esac
