@@ -6,8 +6,13 @@
 # protocol to go wrong - just a file copy onto a mass-storage volume that
 # appears when the board is in its bootloader.
 #
-#   ./tools/flash_uf2.sh prebuilt/esp32_passthrough.hex --yes
-#   ./tools/flash_uf2.sh path/to/your/own/build.hex --yes
+#   ./tools/flash_uf2.sh /tmp/build_blank_argon_uf2/zephyr/zephyr.hex --yes
+#   ./tools/flash_uf2.sh path/to/your/own/bootloader-safe-build.hex --yes
+#
+# The hex must be linked above the SoftDevice/bootloader boundary
+# (0x26000) - e.g. ./tools/build_blank_app.sh argon --uf2's output. A hex
+# linked below that (like most of prebuilt/*.hex, which are built for
+# direct SWD flashing at 0x0) is refused by default - see uf2conv.py.
 #
 # Requirements, both one-time and already covered elsewhere in this repo:
 #   1. Adafruit's nRF52 UF2 bootloader must already be on the board -
@@ -21,25 +26,34 @@
 #      at 1200 baud is what Arduino IDE's own Upload button does to
 #      trigger the same bootloader re-entry, no button press needed).
 #
-# This only ever writes application flash (via the .hex file's own address
-# range) - it never touches the bootloader itself, so it's safe to run
-# repeatedly and cannot brick the board's ability to re-enter UF2 mode.
+# This writes application flash at the .hex file's own address range - it
+# never touches the bootloader itself. uf2conv.py additionally refuses (by
+# default) to convert a hex whose lowest address is below 0x26000, since
+# that would fall inside the SoftDevice/bootloader's own territory once the
+# Adafruit bootloader is on the board - see uf2conv.py's header comment
+# and pass --allow-low-address (forwarded here to uf2conv.py) for the rare
+# legitimate case that needs to bypass it.
 
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 <path/to/firmware.hex> [--yes|-y]" >&2
+    echo "Usage: $0 <path/to/firmware.hex> [--yes|-y] [--allow-low-address]" >&2
     echo "  Converts the hex to UF2 and copies it onto the board's mounted" >&2
     echo "  UF2 boot drive (e.g. XENONBOOT/ARGONBOOT)." >&2
+    echo "  --allow-low-address   bypass uf2conv.py's guard against hexes" >&2
+    echo "                        linked below the bootloader boundary" >&2
+    echo "                        (0x26000) - rarely what you want." >&2
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 HEX_FILE=""
 CONFIRMED=0
+ALLOW_LOW_ADDRESS=0
 for arg in "$@"; do
     case "$arg" in
         --yes|-y) CONFIRMED=1 ;;
+        --allow-low-address) ALLOW_LOW_ADDRESS=1 ;;
         -h|--help) usage; exit 0 ;;
         *)
             if [ -z "$HEX_FILE" ]; then
@@ -120,15 +134,24 @@ fi
 
 echo "Found boot volume: $BOOT_VOLUME"
 
-TMP_UF2="$(mktemp -t flash_uf2.XXXXXX).uf2"
-trap 'rm -f "$TMP_UF2"' EXIT
+# mktemp only substitutes trailing X's, so a directory + fixed filename is
+# the portable way (works with both BSD/macOS and GNU mktemp) to get a
+# real .uf2-suffixed temp file with no leaked, unsuffixed original.
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/flash_uf2.XXXXXX")"
+trap 'rm -rf "$TMP_DIR"' EXIT
+TMP_UF2="${TMP_DIR}/firmware.uf2"
 
-python3 "${SCRIPT_DIR}/uf2conv.py" "$HEX_FILE" "$TMP_UF2"
+UF2CONV_ARGS=("$HEX_FILE" "$TMP_UF2")
+if [ "$ALLOW_LOW_ADDRESS" -eq 1 ]; then
+    UF2CONV_ARGS+=(--allow-low-address)
+fi
+python3 "${SCRIPT_DIR}/uf2conv.py" "${UF2CONV_ARGS[@]}"
 
 echo
 echo "About to copy $(basename "$TMP_UF2") ($(wc -c < "$TMP_UF2") bytes) onto:"
 echo "  $BOOT_VOLUME"
-echo "This only writes application flash - the bootloader is untouched."
+echo "uf2conv.py has already verified this hex is linked above the"
+echo "bootloader boundary (0x26000) - the bootloader itself is untouched."
 echo
 
 if [ "$CONFIRMED" -ne 1 ]; then
@@ -149,7 +172,10 @@ else
     # The board reboots out of mass-storage mode as soon as the UF2 write
     # completes, which can happen mid-cp and make cp report an I/O error.
     # That's the expected, benign race described above - only treat it as
-    # a real failure if the boot volume is still there.
+    # a real failure if the boot volume is still there. Give the unmount a
+    # moment to settle first so a slow unmount doesn't look like a real
+    # failure.
+    sleep 1
     if [ -d "$BOOT_VOLUME" ]; then
         echo "error: failed to copy $(basename "$TMP_UF2") onto $BOOT_VOLUME" >&2
         exit 1

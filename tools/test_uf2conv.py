@@ -47,6 +47,32 @@ class TestParseIhex(unittest.TestCase):
         self.assertEqual(addr, 0x00260000)
         self.assertEqual(bytes(data), b"\xDE\xAD\xBE\xEF")
 
+    def test_extended_segment_address(self):
+        # Extended segment address record (type 0x02, not 0x04) - this is
+        # what the real shipped blank_app UF2 build actually uses. Value
+        # 0x2600 is shifted left 4 bits per the format -> base 0x00026000,
+        # then one data record at offset 0x0000 -> absolute address
+        # 0x00026000. Checksum computed the same way as the other tests
+        # here: two's-complement of the sum of all preceding bytes.
+        #   count=0x02 addr=0x0000 type=0x02 data=0x26,0x00
+        #   sum = 0x02+0x00+0x00+0x02+0x26+0x00 = 0x2A -> checksum = 0xD6
+        hexdata = (
+            ":020000022600D6\n"
+            ":04000000DEADBEEFC4\n"
+            ":00000001FF\n"
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".hex", delete=False) as f:
+            f.write(hexdata)
+            path = f.name
+        try:
+            chunks = uf2conv.parse_ihex(path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(len(chunks), 1)
+        addr, data = chunks[0]
+        self.assertEqual(addr, 0x00026000)
+        self.assertEqual(bytes(data), b"\xDE\xAD\xBE\xEF")
+
     def test_bad_checksum_rejected(self):
         hexdata = ":04000000DEADBEEF00\n:00000001FF\n"  # wrong checksum
         with tempfile.NamedTemporaryFile("w", suffix=".hex", delete=False) as f:
@@ -62,7 +88,7 @@ class TestParseIhex(unittest.TestCase):
 class TestToUf2(unittest.TestCase):
     def test_single_small_block(self):
         chunks = [(0, b"\xDE\xAD\xBE\xEF")]
-        out = uf2conv.to_uf2(chunks)
+        out = uf2conv.to_uf2(chunks, allow_low_address=True)
         self.assertEqual(len(out), uf2conv.BLOCK_SIZE)  # exactly one block
 
         magic0, magic1, flags, block_addr, payload_size, block_no, num_blocks, family_id = (
@@ -86,11 +112,28 @@ class TestToUf2(unittest.TestCase):
 
     def test_two_blocks_for_300_bytes(self):
         data = bytes(range(256)) + bytes(range(44))  # 300 bytes total
-        out = uf2conv.to_uf2([(0x1000, data)])
+        out = uf2conv.to_uf2([(0x1000, data)], allow_low_address=True)
         self.assertEqual(len(out), 2 * uf2conv.BLOCK_SIZE)
         # second block's target address must follow the first payload
         block_addr2 = struct.unpack("<I", out[uf2conv.BLOCK_SIZE + 12:uf2conv.BLOCK_SIZE + 16])[0]
         self.assertEqual(block_addr2, 0x1000 + uf2conv.PAYLOAD_SIZE)
+
+
+class TestLowAddressGuard(unittest.TestCase):
+    def test_low_address_refused_by_default(self):
+        # 0x1000 is well below the 0x26000 SoftDevice/bootloader boundary -
+        # must be refused unless allow_low_address is explicitly passed.
+        with self.assertRaises(ValueError):
+            uf2conv.to_uf2([(0x1000, b"\xDE\xAD\xBE\xEF")])
+
+    def test_low_address_allowed_with_override(self):
+        out = uf2conv.to_uf2([(0x1000, b"\xDE\xAD\xBE\xEF")], allow_low_address=True)
+        self.assertEqual(len(out), uf2conv.BLOCK_SIZE)
+
+    def test_bootloader_safe_address_needs_no_override(self):
+        # At/above the boundary, no flag should be required.
+        out = uf2conv.to_uf2([(uf2conv.BOOTLOADER_SAFE_MIN_ADDR, b"\xDE\xAD\xBE\xEF")])
+        self.assertEqual(len(out), uf2conv.BLOCK_SIZE)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,12 @@ Written from scratch against the public UF2 format spec
 converter. Stdlib only, no dependencies.
 
 Usage:
-    uf2conv.py input.hex output.uf2
+    uf2conv.py input.hex output.uf2 [--allow-low-address]
+
+Refuses by default to convert a hex linked below the SoftDevice/
+bootloader boundary (0x26000) - see to_uf2()'s BOOTLOADER_SAFE_MIN_ADDR
+check - since writing one via UF2 would corrupt that territory.
+--allow-low-address bypasses this for the rare legitimate case.
 """
 import struct
 import sys
@@ -29,6 +34,13 @@ NRF52840_FAMILY_ID = 0xADA52840
 BLOCK_SIZE = 512
 DATA_SIZE = 476
 PAYLOAD_SIZE = 256
+
+# The Adafruit nRF52 UF2 bootloader occupies flash below this address
+# (SoftDevice + bootloader itself). A hex linked below here was NOT built
+# with the UF2/bootloader-safe overlay+conf (see firmware/blank_app's
+# *_uf2.overlay / *_uf2.conf) and writing it via UF2 would overwrite that
+# territory - see to_uf2()'s low-address guard below.
+BOOTLOADER_SAFE_MIN_ADDR = 0x26000
 
 
 def parse_ihex(path):
@@ -80,7 +92,7 @@ def parse_ihex(path):
     return merged
 
 
-def to_uf2(chunks, family_id=NRF52840_FAMILY_ID):
+def to_uf2(chunks, family_id=NRF52840_FAMILY_ID, allow_low_address=False):
     """Split (address, bytes) runs into fixed 256-byte-payload UF2 blocks.
     The final partial block of each run is padded with 0xFF (the erased-
     flash value), never 0x00 - so a short final block never looks like it
@@ -94,6 +106,19 @@ def to_uf2(chunks, family_id=NRF52840_FAMILY_ID):
                 payload += b"\xFF" * (PAYLOAD_SIZE - len(payload))
             blocks.append((addr + offset, payload))
             offset += PAYLOAD_SIZE
+
+    min_addr = min(block_addr for block_addr, _ in blocks)
+    if min_addr < BOOTLOADER_SAFE_MIN_ADDR and not allow_low_address:
+        raise ValueError(
+            f"refusing to convert: lowest address in this hex is "
+            f"{min_addr:#x}, below {BOOTLOADER_SAFE_MIN_ADDR:#x}. This hex "
+            f"was not linked with the UF2/bootloader-safe overlay+conf "
+            f"(see firmware/blank_app's *_uf2.overlay / *_uf2.conf) and "
+            f"writing it via UF2 would overwrite the SoftDevice/bootloader "
+            f"itself. If you really mean to write this low an address "
+            f"(rare - e.g. a deliberate direct SWD-equivalent use case), "
+            f"pass --allow-low-address to override."
+        )
 
     total = len(blocks)
     out = bytearray()
@@ -116,17 +141,29 @@ def to_uf2(chunks, family_id=NRF52840_FAMILY_ID):
 
 
 def main():
-    if len(sys.argv) != 3:
-        print("usage: uf2conv.py input.hex output.uf2", file=sys.stderr)
+    args = sys.argv[1:]
+    allow_low_address = "--allow-low-address" in args
+    positional = [a for a in args if a != "--allow-low-address"]
+
+    if len(positional) != 2:
+        print("usage: uf2conv.py input.hex output.uf2 [--allow-low-address]",
+              file=sys.stderr)
         sys.exit(1)
 
-    chunks = parse_ihex(sys.argv[1])
-    uf2_bytes = to_uf2(chunks)
-    with open(sys.argv[2], "wb") as f:
+    in_path, out_path = positional
+
+    try:
+        chunks = parse_ihex(in_path)
+        uf2_bytes = to_uf2(chunks, allow_low_address=allow_low_address)
+    except (ValueError, OSError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    with open(out_path, "wb") as f:
         f.write(uf2_bytes)
 
     total_bytes = sum(len(d) for _, d in chunks)
-    print(f"Wrote {sys.argv[2]}: {len(uf2_bytes) // BLOCK_SIZE} blocks, "
+    print(f"Wrote {out_path}: {len(uf2_bytes) // BLOCK_SIZE} blocks, "
           f"{total_bytes} bytes of firmware")
 
 
