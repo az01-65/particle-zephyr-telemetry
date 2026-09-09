@@ -139,10 +139,24 @@ if [ "$CONFIRMED" -ne 1 ]; then
     fi
 fi
 
-cp "$TMP_UF2" "$BOOT_VOLUME/"
-sync
-
-echo
-echo "Copied. The board will reboot into the new firmware automatically"
-echo "(the UF2 drive disappears once the write completes - that's expected,"
-echo "not an error)."
+if cp "$TMP_UF2" "$BOOT_VOLUME/"; then
+    sync
+    echo
+    echo "Copied. The board will reboot into the new firmware automatically"
+    echo "(the UF2 drive disappears once the write completes - that's expected,"
+    echo "not an error)."
+else
+    # The board reboots out of mass-storage mode as soon as the UF2 write
+    # completes, which can happen mid-cp and make cp report an I/O error.
+    # That's the expected, benign race described above - only treat it as
+    # a real failure if the boot volume is still there.
+    if [ -d "$BOOT_VOLUME" ]; then
+        echo "error: failed to copy $(basename "$TMP_UF2") onto $BOOT_VOLUME" >&2
+        exit 1
+    fi
+    sync || true
+    echo
+    echo "cp reported an error, but $BOOT_VOLUME is already gone - that's the"
+    echo "expected reboot-mid-write race, not a real failure. The board has"
+    echo "already rebooted into the new firmware. Treating this as success."
+fi
