@@ -1,0 +1,55 @@
+/*
+ * blank_app EXTRA overlay - UF2/bootloader-safe build variant.
+ *
+ * Applied ON TOP OF the board's own particle_argon.overlay /
+ * particle_xenon.overlay (via -DEXTRA_DTC_OVERLAY_FILE), producing a
+ * SEPARATE build meant for installing via UF2 drag-and-drop onto a board
+ * that already has Adafruit's nRF52 bootloader + SoftDevice S140 - NOT
+ * for direct SWD mass-erase flashing (that's what the plain per-board
+ * overlay, unmodified by this file, remains for).
+ *
+ * The default board devicetree links application code at flash address
+ * 0x0 - correct for a bare chip with no bootloader, wrong once a
+ * bootloader/SoftDevice already occupies that address range: writing a
+ * 0x0-linked image through UF2 corrupts the bootloader's own territory
+ * and nothing valid ever boots (confirmed on real hardware this session -
+ * see this project's SDD ledger, Argon UF2 round-trip task).
+ *
+ * 0x26000 is the same flash offset this project's own Arduino-sketch
+ * SWD-flashing tooling already relies on for code living above
+ * SoftDevice S140 and below the bootloader. 0x40000 (256KB) is a
+ * deliberately conservative partition size for a small template app -
+ * far below any real bootloader location near the top of the 1MB flash.
+ *
+ * Partition-conflict note: the board's default devicetree (via
+ * mesh_feather.dtsi -> <nordic/nrf52840_partition.dtsi>) already defines
+ * slot0_partition spanning 0xc000-0x82000, which fully contains our
+ * 0x26000-0x66000 window - a real, physically-overlapping conflict, not
+ * a hypothetical one. It's an MCUboot slot this app has no use for (this
+ * app doesn't use MCUboot), so it's deleted below to clear the range.
+ * Zephyr's own upstream partition layout for this exact scenario -
+ * dts/vendor/nordic/nrf52840_partition_uf2_sdv6.dtsi, used by the real
+ * Adafruit Feather nRF52840 UF2 board target - uses the same
+ * "zephyr,mapped-partition" compatible for its application partition,
+ * so that's what's used here too rather than the older
+ * "fixed-partitions" style (which the board's existing partitions node
+ * doesn't use in the first place).
+ */
+
+/delete-node/ &slot0_partition;
+
+&flash0 {
+	partitions {
+		code_partition: partition@26000 {
+			compatible = "zephyr,mapped-partition";
+			label = "code";
+			reg = <0x00026000 0x00040000>;
+		};
+	};
+};
+
+/ {
+	chosen {
+		zephyr,code-partition = &code_partition;
+	};
+};
