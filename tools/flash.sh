@@ -11,6 +11,7 @@
 #   ./tools/flash.sh xenon-arduino --yes   # Adafruit bootloader for the Xenon's own chip
 #   ./tools/flash.sh argon-arduino --yes   # see CAVEAT in flash_arduino_bootloader.sh's header
 #   ./tools/flash.sh sketch --yes          # flash an already-compiled Arduino sketch over SWD
+#   ./tools/flash.sh uf2 <hex> --yes       # UF2 drag-and-drop, no debug probe needed
 #   ./tools/flash.sh                       # no target named -> asks interactively
 #
 # Anything after the target name (e.g. --yes/-y) is passed straight through

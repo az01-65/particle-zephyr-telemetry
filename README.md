@@ -241,14 +241,20 @@ needs OpenOCD once, to install the bootloader.
 ./tools/flash.sh xenon-arduino --yes    # or argon-arduino
 
 # From then on: double-tap RESET to enter the bootloader (mounts as e.g.
-# XENONBOOT / ARGONBOOT), then drag-and-drop any compatible .hex on:
+# XENONBOOT / ARGONBOOT), then drag-and-drop a bootloader-safe .hex on
+# (one linked above 0x26000 - e.g. ./tools/build_blank_app.sh argon --uf2):
 ./tools/flash.sh uf2 path/to/firmware.hex --yes
 ```
 
 `tools/flash_uf2.sh` converts the `.hex` to `.uf2` (via `tools/uf2conv.py`)
 and copies it onto the mounted boot volume — a scripted drag-and-drop. It
-only ever writes application flash, via the hex file's own address range;
-it never touches the bootloader itself, so it's safe to run repeatedly.
+writes application flash at the hex file's own address range and never
+touches the bootloader itself. `tools/uf2conv.py` also refuses by default
+to convert a hex whose lowest address is below `0x26000` — the SoftDevice/
+bootloader boundary — since writing one via UF2 would corrupt that
+territory; this guard is what actually enforces "safe to run", not an
+assumption about the input. `--allow-low-address` (forwarded from
+`flash_uf2.sh`) bypasses it for the rare legitimate case.
 
 **Proven end-to-end on real Argon hardware this session:** bootloader
 flashed via SWD → `ARGONBOOT` volume mounted → `tools/flash_uf2.sh`
@@ -284,7 +290,7 @@ architectural point, not an implementation detail:
 **Default build** — for direct SWD mass-erase flashing:
 
 ```bash
-west build -b particle_argon firmware/blank_app     # or -b particle_xenon
+./tools/build_blank_app.sh argon        # or xenon
 # then, after a mass erase:
 openocd ... program <hex> verify reset exit
 ```
@@ -298,9 +304,22 @@ reset.
 Arduino-style bootloader-mediated boot:
 
 ```bash
-west build -b particle_argon firmware/blank_app \
-    -DEXTRA_DTC_OVERLAY_FILE=firmware/blank_app/boards/particle_argon_uf2.overlay \
-    -DEXTRA_CONF_FILE=firmware/blank_app/boards/particle_argon_uf2.conf
+./tools/build_blank_app.sh argon --uf2  # or xenon --uf2
+```
+
+Or build it manually, to see exactly what the wrapper does — note both
+`-DEXTRA_*` paths **must be absolute**; Zephyr's build system does not
+absolutize a relative `-DEXTRA_*` path before handing it to the DTS
+preprocessor (which runs from a different working directory), so a
+relative path fails outright with a preprocessor error, it does not
+silently work:
+
+```bash
+cd ~/zephyrproject && source .venv/bin/activate
+west build -p always -b particle_argon -d /tmp/build_blank_argon_uf2 \
+    /path/to/this/repo/firmware/blank_app -- \
+    -DEXTRA_DTC_OVERLAY_FILE=/path/to/this/repo/firmware/blank_app/boards/particle_argon_uf2.overlay \
+    -DEXTRA_CONF_FILE=/path/to/this/repo/firmware/blank_app/boards/particle_argon_uf2.conf
 # swap particle_argon -> particle_xenon and the *_argon_* filenames for the
 # Xenon variant (particle_xenon_uf2.overlay / particle_xenon_uf2.conf)
 ```
@@ -598,6 +617,8 @@ tools/                Flashing scripts + host-side Python utilities
   uf2conv.py            Intel HEX -> UF2 converter (also usable as a CLI)
   test_uf2conv.py       Unit tests for uf2conv.py
   flash_uf2.sh           UF2 drag-and-drop flash wrapper
+  build_blank_app.sh      Builds firmware/blank_app for one board, either
+                           variant (see section 3 above)
 docs/
   TOOLCHAIN.md                        Zephyr SDK / west bring-up notes
   ARGON_XENON_SETUP_GUIDE.md          Board identification, DFU/JTAG basics
