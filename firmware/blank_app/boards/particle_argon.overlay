@@ -1,0 +1,21 @@
+/*
+ * blank_app board overlay - particle_argon
+ *
+ * Repoints the console to USB-CDC-ACM - same fix already applied and
+ * verified on real hardware for argon_gateway/xenon_sensor/esp32_passthrough
+ * (see their own overlays). Nothing else needs adding: led1 (the red
+ * status LED) is already declared as a devicetree alias in the shared
+ * mesh_feather.dtsi this board includes.
+ */
+
+/ {
+	chosen {
+		zephyr,console = &cdc_acm_uart0;
+	};
+};
+
+&zephyr_udc0 {
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};

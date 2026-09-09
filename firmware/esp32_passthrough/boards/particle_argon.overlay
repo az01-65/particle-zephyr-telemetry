@@ -1,0 +1,60 @@
+/*
+ * esp32_passthrough board overlay - particle_argon
+ *
+ * Three things this app needs that the upstream board devicetree doesn't
+ * already provide:
+ *
+ * 1. cdc_acm_uart0 - the host-facing USB-CDC port. Same node this project's
+ *    other two apps already add (see their own overlays), but deliberately
+ *    NOT wired to zephyr,console here - this app owns it entirely as a raw
+ *    byte pipe for actual ESP32 flashing traffic, and log output landing on
+ *    the same wire would corrupt it. zephyr,console is left at the board's
+ *    own default (&uart0), which nothing is physically wired to on this
+ *    bench setup (confirmed by argon_gateway's real hardware test) - a safe,
+ *    harmless sink for this app's own diagnostic logging.
+ *
+ * 2. uart-bridge0 - Zephyr's own in-tree USB<->UART bridge driver
+ *    (drivers/serial/uart_bridge.c, see zephyr,uart-bridge.yaml), wired
+ *    between cdc_acm_uart0 and &uart1. &uart1 is already declared, enabled,
+ *    and pinctrl'd at 921600 baud in this exact board's own upstream
+ *    devicetree (boards/particle/argon/particle_argon.dts), labeled ESP32
+ *    right in that file's own comment - that is the real UART link to the
+ *    onboard ESP32, already correct with zero changes needed here. The bridge
+ *    driver does the actual byte-for-byte pumping and baud-rate propagation
+ *    (interrupt-driven, ring-buffered) - not reimplemented in this app.
+ *
+ * 3. zephyr,user espboot-gpios / espen-gpios - the ESP32's GPIO0 (boot mode
+ *    select) and EN (reset) pins. These carry the DTR/RTS-driven auto-reset
+ *    sequence that lets unmodified esptool.py/Arduino IDE flash the ESP32
+ *    exactly like any normal, directly-USB-attached board (see src/main.c
+ *    for that logic - the generic uart-bridge driver above only knows about
+ *    data and line coding, not these two control pins).
+ *
+ *    Pin numbers (P0.16 for ESPBOOT, P0.24 for ESPEN) are NOT documented
+ *    anywhere in Zephyr itself - there is no existing binding or board file
+ *    reference for either. They come from Particle's own published
+ *    Device OS source (hal/src/argon/pinmap_hal.c, PLATFORM_ARGON pin
+ *    table's ESPBOOT/ESPEN rows), cross-checked against this exact board's
+ *    own uart1 pinctrl above: that same source table's TX1/RX1/CTS1/RTS1
+ *    rows (P1.05/P1.04/P1.06/P1.07) match this board's uart1_default
+ *    pinctrl byte-for-byte, which is what makes the otherwise-undocumented
+ *    ESPBOOT/ESPEN rows in that same table trustworthy.
+ */
+
+/ {
+	uart_bridge0: uart-bridge0 {
+		compatible = "zephyr,uart-bridge";
+		peers = <&cdc_acm_uart0 &uart1>;
+	};
+
+	zephyr,user {
+		espboot-gpios = <&gpio0 16 GPIO_ACTIVE_HIGH>;
+		espen-gpios = <&gpio0 24 (GPIO_ACTIVE_LOW | GPIO_OPEN_DRAIN)>;
+	};
+};
+
+&zephyr_udc0 {
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};

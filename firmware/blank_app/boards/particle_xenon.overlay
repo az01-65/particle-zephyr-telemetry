@@ -1,0 +1,18 @@
+/*
+ * blank_app board overlay - particle_xenon
+ *
+ * Same USB-CDC-ACM console fix as boards/particle_argon.overlay - see
+ * that file's comment for the full writeup.
+ */
+
+/ {
+	chosen {
+		zephyr,console = &cdc_acm_uart0;
+	};
+};
+
+&zephyr_udc0 {
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};
